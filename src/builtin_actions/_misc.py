@@ -59,13 +59,13 @@ async def action_daily_brief(owner: str, **kwargs) -> Tuple[str, bool]:
             conn = _imap_connect(None)
             try:
                 conn.select("INBOX", readonly=True)
-                status, data = conn.search(None, "UNSEEN")
+                status, data = conn.uid("SEARCH", None, "UNSEEN")
                 uids = (data[0].split() if status == "OK" and data and data[0] else [])
                 unread_count = len(uids)
                 # Grab headers for the most recent 5 unread (UIDs increase with arrival)
                 for uid in uids[-5:][::-1]:
                     try:
-                        _, msg_data = conn.fetch(uid, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])")
+                        _, msg_data = conn.uid("FETCH", uid, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])")
                         if not msg_data or not msg_data[0]:
                             continue
                         hdr = msg_data[0][1] if isinstance(msg_data[0], tuple) else msg_data[0]

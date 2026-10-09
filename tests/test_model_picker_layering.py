@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 
 from tests.helpers.css_loader import read_css_with_imports
 
@@ -45,7 +46,10 @@ def test_chat_model_picker_sits_above_minimized_dock_below_windows():
 
 
 def test_model_picker_layer_cache_bumped():
-    assert "const CACHE_NAME = 'odysseus-v429';" in SW_JS
+    cache = re.search(r"const CACHE_NAME = ['\"]odysseus-v(\d+)[^'\"]*['\"];", SW_JS)
+    assert cache, "service worker must define a versioned app cache"
+    assert int(cache.group(1)) > 429, "picker styles must invalidate the previous v429 cache"
+    assert "keys.filter(k => k !== CACHE_NAME).map(k => caches.delete(k))" in SW_JS
 
 
 def test_compare_searchable_picker_uses_dropdown_trigger_not_search_textbox():

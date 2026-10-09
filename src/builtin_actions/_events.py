@@ -327,14 +327,14 @@ async def action_learn_sender_signatures(owner: str, **kwargs) -> Tuple[str, boo
             conn = _imap_connect(None, owner=owner)
             try:
                 conn.select("INBOX", readonly=True)
-                status, data = conn.search(None, "ALL")
+                status, data = conn.uid("SEARCH", None, "ALL")
                 if status != "OK" or not data or not data[0]:
                     return results
                 uids = data[0].split()[-300:][::-1]  # newest 300
                 for uid in uids:
                     try:
-                        st, msg_data = conn.fetch(
-                            uid, "(BODY.PEEK[HEADER.FIELDS (FROM)])"
+                        st, msg_data = conn.uid(
+                            "FETCH", uid, "(BODY.PEEK[HEADER.FIELDS (FROM)])"
                         )
                         if st != "OK" or not msg_data or not msg_data[0]:
                             continue
@@ -416,7 +416,7 @@ async def action_learn_sender_signatures(owner: str, **kwargs) -> Tuple[str, boo
                     conn2.select("INBOX", readonly=True)
                     for mm in _msgs:
                         try:
-                            st, data = conn2.fetch(mm["uid"], "(BODY.PEEK[TEXT])")
+                            st, data = conn2.uid("FETCH", mm["uid"], "(BODY.PEEK[TEXT])")
                             if st != "OK" or not data or not data[0]:
                                 continue
                             raw = data[0][1] if isinstance(data[0], tuple) else None

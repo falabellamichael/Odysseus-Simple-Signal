@@ -254,7 +254,7 @@ def test_direct_image_generation_does_not_fallback_when_session_model_selected(m
 
 def test_agent_generate_image_tool_does_not_fallback_when_session_model_selected(monkeypatch):
     from src import runcomfy_media
-    from src.tool_execution import execute_tool_block
+    from src.tool_execution import NO_TOOL_SECURITY_CONTEXT, execute_tool_block
     from src.agent_tools import ToolBlock
 
     async def fake_generate_image(content, session_id=None, owner=None):
@@ -270,6 +270,7 @@ def test_agent_generate_image_tool_does_not_fallback_when_session_model_selected
     _desc, result = asyncio.run(
         execute_tool_block(
             ToolBlock("generate_image", "create an image of a micro bulldog"),
+            security_context=NO_TOOL_SECURITY_CONTEXT,
             session_id="s1",
             owner="alice",
         )

@@ -25,6 +25,7 @@ loop but don't exercise the file/cache patches added to the route.
 """
 import asyncio
 import json
+import os
 import sys
 import types
 from pathlib import Path
@@ -114,6 +115,12 @@ def _force_sql_owner_migration_failure(monkeypatch):
         def filter(self, *_args, **_kwargs):
             return self
 
+        def order_by(self, *_args, **_kwargs):
+            return self
+
+        def all(self):
+            return []
+
         def update(self, *_args, **_kwargs):
             raise RuntimeError("forced owner migration failure")
 
@@ -124,6 +131,12 @@ def _force_sql_owner_migration_failure(monkeypatch):
 
         def query(self, _model):
             return FailingQuery()
+
+        def get_bind(self):
+            return SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+
+        def get(self, _model, _key, **_kwargs):
+            return object()
 
         def rollback(self):
             self.rolled_back = True
@@ -471,7 +484,8 @@ def test_rename_updates_upload_metadata_owner(rename_endpoint):
     updated = json.loads((upload_dir / "uploads.json").read_text(encoding="utf-8"))
     assert "alice:hash-alice" not in updated
     assert updated["alice2:hash-alice"]["owner"] == "alice2"
-    assert handler.resolve_upload(upload_id, owner="alice2")["path"] == str(upload_path)
+    resolved_path = handler.resolve_upload(upload_id, owner="alice2")["path"]
+    assert os.path.normcase(resolved_path) == os.path.normcase(str(upload_path))
     assert handler.resolve_upload(upload_id, owner="alice") is None
 
 

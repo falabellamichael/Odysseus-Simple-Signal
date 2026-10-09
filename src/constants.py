@@ -17,7 +17,6 @@ DATA_DIR = os.getenv("ODYSSEUS_DATA_DIR", get_default_data_dir())
 # re-deriving paths from __file__ or a relative "data" literal.
 SESSIONS_FILE = os.path.join(DATA_DIR, "sessions.json")
 MEMORY_FILE = os.path.join(DATA_DIR, "memory.json")
-MEMORY_DOC = os.path.join(DATA_DIR, "memory_doc.md")
 PERSONAL_DIR = os.path.join(DATA_DIR, "personal_docs")
 RUNBOOK_DIR = os.path.join(PERSONAL_DIR, "runbook")
 UPLOAD_DIR = os.path.join(DATA_DIR, "uploads")
@@ -54,6 +53,11 @@ SKILLS_DIR = os.path.join(DATA_DIR, "skills")
 GALLERY_DIR = os.path.join(DATA_DIR, "gallery")
 GALLERY_UPLOADS_DIR = os.path.join(DATA_DIR, "gallery_uploads")
 MEMORY_VECTORS_DIR = os.path.join(DATA_DIR, "memory_vectors")
+
+# The only part of DATA_DIR the agent's file tools and subprocesses may touch.
+# Everything else under DATA_DIR is application state (session store, auth
+# database, encryption key, settings), and the agent has no business reading it.
+AGENT_WORKSPACE_DIR = os.path.join(DATA_DIR, "agent_workspace")
 
 # Paths with an intentional dedicated env override, defaulting under DATA_DIR.
 MAIL_ATTACHMENTS_DIR = os.getenv("ODYSSEUS_MAIL_ATTACHMENTS_DIR", os.path.join(DATA_DIR, "mail-attachments"))

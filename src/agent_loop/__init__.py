@@ -71,3 +71,87 @@ __all__ = [
     "get_builtin_overrides",
     "stream_agent_loop",
 ]
+
+
+# Compatibility exports for upstream callers of the former single module.
+from src.agent_loop._helpers import (
+    _DESTRUCTIVE_REQUEST_RE,
+    _EXPLICIT_WORKSPACE_REFERENCE_RE,
+    _FAKE_SUCCESS_RE,
+    _LOCAL_COMPUTER_REFERENCE_RE,
+    _ODY_QWEN_TEXT_FIXES,
+    _WORKSPACE_CODE_ACTION_RE,
+    _WORKSPACE_CODE_TARGET_RE,
+    _document_stream_events,
+    _explicitly_references_missing_workspace,
+    _is_odysseus_qwen_model,
+    _local_computer_rules,
+    _looks_like_destructive_request,
+    _looks_like_local_computer_request,
+    _looks_like_notes_calendar_followup,
+    _looks_like_success_claim,
+    _looks_like_workspace_coding_request,
+    _minimal_recent_notes_tool_context_message,
+    _normalize_ody_qwen_text_artifacts,
+    _ody_qwen_temperature_cap,
+    _prepend_agent_directive,
+    _resolved_tool_event_name,
+    _strip_agent_injected_messages,
+    _workspace_coding_rules,
+)
+from src.agent_loop._loop import (
+    _usage_bucket,
+    _usage_bucket_summary,
+)
+from src.agent_loop._prompts import (
+    _BROWSER_MCP_PREFIX,
+    _WORKSPACE_TERMINUS_TOOLS,
+    _agent_route_tool_mode,
+    _calendar_list_summary_from_tool_output,
+    _email_list_summary_from_tool_output,
+    _email_read_summary_from_tool_output,
+    _expand_browser_mcp_tools,
+    _format_email_summary_item,
+    _ody_qwen_terminal_tool_summary,
+)
+
+from src.agent_loop._helpers import (
+    _is_local_openai_compat_url,
+    _extract_last_user_message,
+    _user_turn_count,
+    _insert_before_latest_user,
+    _is_continuation_request,
+    _recent_tool_events,
+    _recent_tool_event_names,
+    _message_text,
+    _is_injected_context_message,
+    _is_real_conversation_message,
+    _collect_tool_events_for_brief,
+    _recent_turns_for_brief,
+    _build_conversation_brief_message,
+    _build_continuation_trace_message,
+    _assistant_requested_followup,
+    _turn_targets_active_document,
+    _is_email_document_obj,
+    _minimal_saved_memory_message,
+    _compact_email_draft_context,
+    _minimal_odysseus_doc_messages,
+    _looks_like_notes_turn,
+    _minimal_odysseus_notes_messages,
+    _looks_like_memory_identity_turn,
+    _minimal_odysseus_general_messages,
+    _strip_doc_model_artifacts,
+    _normalize_truncated_document_tool_fences,
+)
+from src.agent_loop._loop import (
+    _build_actions_snapshot,
+    _run_verifier_subagent,
+)
+from src.agent_loop._prompts import (
+    _looks_like_notes_list_request,
+    _note_list_summary_from_tool_output,
+    _load_mcp_disabled_map,
+    _active_workspace_note,
+    _section_text,
+    _compact_tool_line,
+)

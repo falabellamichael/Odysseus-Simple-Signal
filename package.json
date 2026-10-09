@@ -12,7 +12,7 @@
                        "url":  "https://github.com/falabellamichael/Odysseus-Simple-Signal.git"
                    },
     "devDependencies":  {
-                            "@antithesishq/bombadil":  "^0.3.2",
+                            "@antithesishq/bombadil":  "^0.7.0",
                             "electron":  "^42.4.0",
                             "electron-builder":  "^26.15.3",
                             "wait-on":  "^9.0.10"

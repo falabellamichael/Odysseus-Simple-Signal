@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/odysseus-wordmark.png" alt="Odysseus" width="238">
+  <img src="assets/branding/odysseus-wordmark.png" alt="Odysseus" width="238">
 </p>
 
 ## Modified Distribution Notice
@@ -14,7 +14,7 @@ June 14, 2026. The original AGPL-3.0 license is preserved in [LICENSE](LICENSE).
 
 <p align="center">
   <a href="#quick-start">Quick Start</a> ·
-  <a href="docs/setup.md">Setup Guide</a> ·
+  <a href="website/setup.md">Setup Guide</a> ·
   <a href="CONTRIBUTING.md">Contributing</a> ·
   <a href="ROADMAP.md">Roadmap</a>
 </p>
@@ -24,17 +24,17 @@ June 14, 2026. The original AGPL-3.0 license is preserved in [LICENSE](LICENSE).
 </p>
 
 <p align="center">
-  <img src="docs/odysseus-browser.jpg" alt="Odysseus interface">
+  <img src="assets/branding/odysseus-browser.jpg" alt="Odysseus interface">
 </p>
 
 ---
 
 ## Quick Start
 
-> `dev` is the default branch and gets the newest changes first. Use [`main`](https://github.com/pewdiepie-archdaemon/odysseus/tree/main) if you want the more curated branch.
+> `dev` is the default branch and gets the newest changes first. Use [`main`](https://github.com/odysseus-dev/odysseus/tree/main) if you want the more curated branch.
 
 ```bash
-git clone https://github.com/pewdiepie-archdaemon/odysseus.git
+git clone https://github.com/odysseus-dev/odysseus.git
 cd odysseus
 cp .env.example .env
 docker compose up -d --build
@@ -42,7 +42,7 @@ docker compose up -d --build
 
 Open `http://localhost:7000` when the containers are healthy. The first admin password is printed in `docker compose logs odysseus`.
 
-Native installs, GPU notes, Windows/macOS instructions, HTTPS, and configuration live in the [setup guide](docs/setup.md).
+Native installs, GPU notes, Windows/macOS instructions, HTTPS, and configuration live in the [setup guide](website/setup.md).
 
 ## Features
 
@@ -56,6 +56,10 @@ Native installs, GPU notes, Windows/macOS instructions, HTTPS, and configuration
 - **Extras** — gallery/image editor, themes, uploads, web search, presets, sessions, and 2FA.
 
 ## Demo
+
+A full hover-to-play tour lives on the [Odysseus landing page](https://odysseus-dev.github.io/odysseus/). Its source lives under [`website/`](website/).
+
+### Native macOS
 
 ```bash
 ODYSSEUS_HOST=0.0.0.0 ./start-macos.sh
@@ -214,7 +218,7 @@ docker compose logs odysseus | grep -E 'ChromaDB|MemoryVectorStore|DEGRADED'
 **macOS details.** `start-macos.sh` installs Homebrew deps, creates the venv,
 runs setup, and starts uvicorn on port `7860` because AirPlay often holds
 `7000`. It uses llama.cpp/Ollama for Metal. vLLM/SGLang are CUDA/ROCm-only and
-do not run on macOS. MLX-only models are not served by Odysseus.
+do not run on macOS. See the [setup guide](website/setup.md) for optional MLX image workflows.
 
 </details>
 
@@ -295,7 +299,7 @@ To expose Odysseus on a local network or Tailscale with HTTPS:
 ### Outlook / Office 365 email
 Odysseus email accounts currently use IMAP/SMTP username-password auth. Outlook
 and Microsoft 365 generally require OAuth instead, so normal Microsoft mailbox
-passwords will fail. See [docs/email-outlook.md](docs/email-outlook.md) for the
+passwords will fail. See [website/email-outlook.md](website/email-outlook.md) for the
 current limitation and the planned integration direction.
 
 ## Security Notes
@@ -341,15 +345,20 @@ Help is welcome. The best entry points are fresh-install testing, provider setup
 
 ## Security
 
-Odysseus is a self-hosted workspace with powerful local tools. Keep auth enabled, keep private data out of Git, and do not expose raw model/service ports publicly. Deployment details are in the [setup guide](docs/setup.md#security-notes).
+Odysseus is a self-hosted workspace with powerful local tools. Keep auth enabled, keep private data out of Git, and do not expose raw model/service ports publicly.
+
+- Keep `AUTH_ENABLED=true` for any network-accessible deployment.
+- Keep `LOCALHOST_BYPASS=false` outside local development.
+
+Deployment details are in the [setup guide](website/setup.md#security-notes).
 
 ## Star History
 
-<a href="https://www.star-history.com/?repos=pewdiepie-archdaemon%2Fodysseus&type=date&legend=top-left">
+<a href="https://star-history.dera.page/#odysseus-dev/odysseus&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=pewdiepie-archdaemon/odysseus&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=pewdiepie-archdaemon/odysseus&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=pewdiepie-archdaemon/odysseus&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=odysseus-dev/odysseus&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=odysseus-dev/odysseus&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=odysseus-dev/odysseus&type=date&legend=top-left" />
  </picture>
 </a>
 

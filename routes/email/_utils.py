@@ -20,11 +20,13 @@ import email as email_mod
 import email.header
 import email.utils
 import smtplib
+import ssl
 import json
 import re
 import html
 import io
 import zipfile
+from urllib.parse import parse_qs, unquote, urlparse
 from html.parser import HTMLParser as _HTMLParser
 import logging
 import uuid
@@ -43,10 +45,12 @@ from src.upload_limits import read_upload_limited, EMAIL_COMPOSE_UPLOAD_MAX_BYTE
 
 from routes.email_helpers import (
     _strip_think, _extract_reply, _apply_email_style_mechanics, require_owner, require_user, _assert_owns_account,
+    _account_visible_to_owner,
     _q, _attach_compose_uploads, _cleanup_compose_uploads,
     _load_settings, _save_settings, _get_email_config,
     _send_smtp_message, _smtp_security_mode,
     _IMAP_TIMEOUT_SECONDS, _open_imap_connection, _normalize_imap_starttls,
+    _get_valid_google_token, _xoauth2_bytes, _xoauth2_raw,
     make_oauth_state, verify_oauth_state,
     EmailNotConfiguredError,
     _imap_connect, _imap, _decode_header, _detect_sent_folder, _detect_drafts_folder,
@@ -54,7 +58,8 @@ from routes.email_helpers import (
     _extract_attachment_to_disk, _extract_html, _extract_text,
     _fetch_sender_thread_context, _pre_retrieve_context,
     _EMAIL_REPLY_SYS_PROMPT_BASE, _POOL_HOOKS,
-    _friendly_email_auth_error,
+    _friendly_email_auth_error, _email_summary_failure_log_detail,
+    _generate_email_summary, EMAIL_SUMMARY_ERROR_CODE, EMAIL_SUMMARY_ERROR_MESSAGE,
     SendEmailRequest, ExtractStyleRequest,
     ATTACHMENTS_DIR, COMPOSE_UPLOADS_DIR, SCHEDULED_DB,
     attachment_extract_dir, _email_cache_owner_clause, email_translation_body_hash,
@@ -65,6 +70,107 @@ logger = logging.getLogger(__name__)
 
 ODYSSEUS_MAIL_ORIGIN = "odysseus-ui"
 EMAIL_READ_ATTACHMENT_VERSION = 2
+_GOOGLE_OAUTH_IMAP_HOST = "imap.gmail.com"
+_GOOGLE_OAUTH_SMTP_HOST = "smtp.gmail.com"
+_SERVER_OWNED_OAUTH_FIELDS = {
+    "oauth_provider",
+    "oauth_access_token",
+    "oauth_refresh_token",
+    "oauth_token_expiry",
+}
+
+
+def _normalized_mail_host(value) -> str:
+    """Normalize a mail hostname for exact provider-bound comparisons."""
+    return str(value or "").strip().lower().rstrip(".")
+
+
+def _google_oauth_imap_transport_allowed(port: int, starttls: bool) -> bool:
+    return (port == 993 and not starttls) or (port == 143 and starttls)
+
+
+def _google_oauth_smtp_transport_allowed(port: int, security: str) -> bool:
+    return (port == 465 and security == "ssl") or (port == 587 and security == "starttls")
+
+def _email_style_key(account_id: str | None) -> str:
+    return str(account_id or "").strip()
+
+
+def _get_email_writing_style_for_account(settings: dict, account_id: str | None = None) -> str:
+    key = _email_style_key(account_id)
+    by_account = settings.get("email_writing_styles_by_account") or {}
+    if key and isinstance(by_account, dict):
+        val = by_account.get(key)
+        if isinstance(val, str) and val.strip():
+            return val
+    return str(settings.get("email_writing_style") or "")
+
+
+def _set_email_writing_style_for_account(settings: dict, style: str, account_id: str | None = None) -> None:
+    key = _email_style_key(account_id)
+    style = str(style or "")
+    if key:
+        by_account = settings.get("email_writing_styles_by_account")
+        if not isinstance(by_account, dict):
+            by_account = {}
+        by_account[key] = style
+        settings["email_writing_styles_by_account"] = by_account
+        return
+    settings["email_writing_style"] = style
+
+
+_AUTO_REPLY_BOOL_KEYS = {
+    "email_auto_reply",
+    "email_auto_reply_exclude_automated",
+    "email_auto_reply_pause_notifications",
+}
+_AUTO_REPLY_TEXT_KEYS = {
+    "email_auto_reply_start",
+    "email_auto_reply_end",
+    "email_auto_reply_subject",
+    "email_auto_reply_message",
+    "email_auto_reply_cooldown",
+    "email_auto_reply_scope",
+    "email_auto_reply_account_id",
+    "email_auto_reply_enabled_at",
+}
+_AUTO_REPLY_KEYS = _AUTO_REPLY_BOOL_KEYS | _AUTO_REPLY_TEXT_KEYS
+
+
+def _get_auto_reply_settings_for_account(settings: dict, account_id: str | None = None) -> dict:
+    key = _email_style_key(account_id)
+    out = {k: settings.get(k) for k in _AUTO_REPLY_KEYS if k in settings}
+    by_account = settings.get("email_auto_reply_by_account") or {}
+    if key and isinstance(by_account, dict) and isinstance(by_account.get(key), dict):
+        out.update({k: v for k, v in by_account[key].items() if k in _AUTO_REPLY_KEYS})
+    return out
+
+
+def _set_auto_reply_settings_for_account(settings: dict, data: dict, account_id: str | None = None) -> tuple[bool, bool]:
+    key = _email_style_key(account_id)
+    target = _get_auto_reply_settings_for_account(settings, account_id) if key else settings
+    prev_auto_reply = bool(target.get("email_auto_reply", False))
+    for name in _AUTO_REPLY_BOOL_KEYS:
+        if name in data:
+            target[name] = bool(data[name])
+    for name in _AUTO_REPLY_TEXT_KEYS - {"email_auto_reply_enabled_at"}:
+        if name in data:
+            target[name] = str(data.get(name) or "").strip()
+    if "email_auto_reply" in data:
+        next_auto_reply = bool(target.get("email_auto_reply", False))
+        if next_auto_reply and (not prev_auto_reply or not str(target.get("email_auto_reply_enabled_at") or "").strip()):
+            target["email_auto_reply_enabled_at"] = datetime.utcnow().isoformat()
+        elif not next_auto_reply:
+            target.pop("email_auto_reply_enabled_at", None)
+    if key:
+        by_account = settings.get("email_auto_reply_by_account")
+        if not isinstance(by_account, dict):
+            by_account = {}
+        by_account[key] = {k: target.get(k) for k in _AUTO_REPLY_KEYS if k in target}
+        by_account[key]["email_auto_reply_account_id"] = key
+        by_account[key]["email_auto_reply_scope"] = "account"
+        settings["email_auto_reply_by_account"] = by_account
+    return prev_auto_reply, bool(target.get("email_auto_reply", False))
 
 
 
@@ -89,6 +195,64 @@ def _coerce_port(value, default):
         return int(value), None
     except (TypeError, ValueError):
         return None, f"Invalid port {value!r}; must be a whole number"
+
+
+def _lock_email_account_owner_mutation(db, *owners: str) -> None:
+    """Delegate account/default serialization to the shared DB primitive."""
+    from core.database import lock_email_account_owner_mutations
+
+    lock_email_account_owner_mutations(db, *owners)
+
+
+def _email_account_owner_scope(query, owner: str):
+    """Restrict a query to one normalized EmailAccount owner partition."""
+    from core.database import EmailAccount
+    from sqlalchemy import or_
+
+    if owner:
+        return query.filter(EmailAccount.owner == owner)
+    return query.filter(or_(EmailAccount.owner == None, EmailAccount.owner == ""))  # noqa: E711
+
+
+def _discover_email_account_mutation_scope(account_id: str, owner: str) -> str:
+    """Read the initial lock key and fail closed before a mutation session."""
+    from core.database import EmailAccount, SessionLocal
+
+    db = SessionLocal()
+    try:
+        row = db.get(EmailAccount, account_id)
+        if row is None or (owner and not _account_visible_to_owner(row, owner)):
+            raise HTTPException(404, "Account not found")
+        return row.owner or ""
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Account-owner mutation check failed: %s", exc)
+        raise HTTPException(503, "Account check failed")
+    finally:
+        db.close()
+
+
+def _lock_and_reload_email_account(db, account_id: str, owner: str, scope: str):
+    """Lock, reload, and revalidate an account, retrying if its owner moved."""
+    from core.database import EmailAccount
+
+    owner_scopes = {scope or ""}
+    while True:
+        _lock_email_account_owner_mutation(db, *owner_scopes)
+        row = db.get(EmailAccount, account_id, populate_existing=True)
+        if row is None or (owner and not _account_visible_to_owner(row, owner)):
+            raise HTTPException(404, "Account not found")
+
+        current_scope = row.owner or ""
+        if current_scope in owner_scopes or db.get_bind().dialect.name == "sqlite":
+            return row
+
+        # The account changed owner after discovery but before lock acquisition.
+        # Release the partial lock set and reacquire all observed scopes in the
+        # shared helper's canonical order, then validate from the database again.
+        db.rollback()
+        owner_scopes.add(current_scope)
 
 
 def _email_tag_owner_aliases(account_id: str | None, owner: str = "") -> list[str]:
@@ -251,6 +415,25 @@ def _record_email_received_events(owner: str, account_id: str | None, folder: st
             for _ in new_keys[:50]:
                 fire_event("email_received", owner)
             logger.info("Fired email_received for %d new message(s)", min(len(new_keys), 50))
+            try:
+                loop = asyncio.get_running_loop()
+
+                async def _run_away_reply_check():
+                    try:
+                        from routes.email_pollers import _auto_summarize_pass
+                        result = await _auto_summarize_pass(
+                            days_back=1,
+                            account_id=account_id,
+                            max_process=min(max(len(new_keys), 1), 5),
+                            away_only=True,
+                        )
+                        logger.info("Auto away-reply pass after email_received account=%s: %s", account_id, result)
+                    except Exception:
+                        logger.warning("Auto away-reply pass after email_received failed", exc_info=True)
+
+                loop.create_task(_run_away_reply_check())
+            except RuntimeError:
+                logger.debug("No running event loop for immediate away-reply check")
     except Exception:
         logger.debug("email_received event detection skipped", exc_info=True)
 
@@ -359,6 +542,148 @@ def _message_id_chain(*values: str) -> list[str]:
 def _uid_from_fetch_meta(meta_b: bytes) -> str:
     m = re.search(rb"\bUID\s+(\d+)\b", meta_b)
     return m.group(1).decode() if m else ""
+
+
+def _parse_list_unsubscribe_header(value: str | None) -> list[dict]:
+    """Parse RFC List-Unsubscribe entries into safe reviewable actions.
+
+    We return mailto/http entries but only the mailto kind is executable by the
+    first-pass Odysseus flow. HTTP unsubscribe links are useful evidence but
+    often contain tracking tokens and should be opened manually unless/until we
+    add a browser-confirmed flow.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return []
+    pieces = re.findall(r"<([^>]+)>", raw)
+    if not pieces:
+        pieces = [p.strip() for p in raw.split(",") if p.strip()]
+    out: list[dict] = []
+    seen = set()
+    for piece in pieces:
+        target = piece.strip().strip("<>").strip()
+        if not target:
+            continue
+        parsed = urlparse(target)
+        scheme = parsed.scheme.lower()
+        key = target.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if scheme == "mailto":
+            addr = unquote(parsed.path or "").strip()
+            if not addr or "\r" in addr or "\n" in addr:
+                continue
+            query = parse_qs(parsed.query or "", keep_blank_values=True)
+            subject = unquote((query.get("subject") or ["unsubscribe"])[0] or "unsubscribe")
+            body = unquote((query.get("body") or ["unsubscribe"])[0] or "unsubscribe")
+            subject = re.sub(r"[\r\n]+", " ", subject).strip() or "unsubscribe"
+            body = re.sub(r"[\r\n]+", "\n", body).strip() or "unsubscribe"
+            out.append({
+                "kind": "mailto",
+                "target": addr,
+                "subject": subject[:200],
+                "body": body[:1000],
+                "executable": True,
+            })
+        elif scheme in {"http", "https"}:
+            out.append({
+                "kind": "url",
+                "target": target,
+                "executable": False,
+            })
+    return out
+
+
+def _email_unsubscribe_candidate_from_msg(msg, uid: str, folder: str, *, spam_cached: dict | None = None) -> dict | None:
+    sender = _decode_header(msg.get("From", ""))
+    sender_name, sender_addr = email.utils.parseaddr(sender)
+    subject = _decode_header(msg.get("Subject", "(no subject)"))
+    list_id = _decode_header(msg.get("List-Id", ""))
+    precedence = (msg.get("Precedence") or "").strip().lower()
+    auto_submitted = (msg.get("Auto-Submitted") or "").strip().lower()
+    methods = _parse_list_unsubscribe_header(msg.get("List-Unsubscribe"))
+    has_unsub = bool(methods)
+    reasons: list[str] = []
+    score = 0
+    if has_unsub:
+        score += 45
+        reasons.append("has unsubscribe header")
+    if list_id:
+        score += 20
+        reasons.append("mailing-list header")
+    if precedence in {"bulk", "junk", "list"}:
+        score += 20
+        reasons.append(f"precedence={precedence}")
+    if auto_submitted and auto_submitted != "no":
+        score += 10
+        reasons.append(f"auto-submitted={auto_submitted}")
+    if spam_cached and spam_cached.get("spam"):
+        score += 35
+        if spam_cached.get("reason"):
+            reasons.append(str(spam_cached.get("reason")))
+        else:
+            reasons.append("previously classified as spam")
+    subj_l = (subject or "").lower()
+    if re.search(r"\b(unsubscribe|newsletter|sale|discount|offer|promo|limited time)\b", subj_l):
+        score += 10
+        reasons.append("promotional subject")
+    executable = [m for m in methods if m.get("executable")]
+    if score < 45 or not has_unsub:
+        return None
+    return {
+        "uid": str(uid),
+        "folder": folder,
+        "message_id": (msg.get("Message-ID") or "").strip(),
+        "subject": subject,
+        "from_name": sender_name or sender_addr,
+        "from_address": sender_addr,
+        "list_id": list_id,
+        "score": min(score, 100),
+        "reasons": reasons[:5],
+        "methods": methods,
+        "can_execute": bool(executable),
+        "recommended_method": executable[0] if executable else (methods[0] if methods else None),
+        "spam_reason": (spam_cached or {}).get("reason") or "",
+    }
+
+
+def _unsubscribe_candidate_dedupe_key(candidate: dict) -> tuple[str, str, str]:
+    list_id = str(candidate.get("list_id") or "").strip().lower()
+    method = candidate.get("recommended_method") or {}
+    method_kind = str(method.get("kind") or "").strip().lower()
+    method_target = str(method.get("target") or "").strip().lower()
+    sender = str(candidate.get("from_address") or "").strip().lower()
+    if list_id:
+        return ("list", list_id, method_target or sender)
+    if method_target:
+        return ("method", method_kind, method_target)
+    return ("sender", sender, str(candidate.get("subject") or "").strip().lower())
+
+
+def _dedupe_unsubscribe_candidates(candidates: list[dict]) -> list[dict]:
+    deduped: dict[tuple[str, str, str], dict] = {}
+    for candidate in candidates or []:
+        key = _unsubscribe_candidate_dedupe_key(candidate)
+        existing = deduped.get(key)
+        if not existing:
+            copy = dict(candidate)
+            copy["duplicate_count"] = 1
+            copy["duplicate_uids"] = [str(candidate.get("uid") or "")]
+            deduped[key] = copy
+            continue
+        existing["duplicate_count"] = int(existing.get("duplicate_count") or 1) + 1
+        uid = str(candidate.get("uid") or "")
+        if uid:
+            existing.setdefault("duplicate_uids", []).append(uid)
+        if int(candidate.get("score") or 0) > int(existing.get("score") or 0):
+            keep_count = existing.get("duplicate_count")
+            keep_uids = existing.get("duplicate_uids")
+            replacement = dict(candidate)
+            replacement["duplicate_count"] = keep_count
+            replacement["duplicate_uids"] = keep_uids
+            deduped[key] = replacement
+    return list(deduped.values())
 
 
 _FETCH_SEQ_RE = re.compile(rb"^(\d+)\s+\(")
@@ -493,6 +818,82 @@ def _email_index_rows(owner: str, account_id: str | None, folder: str, uids: lis
             "has_attachments": bool(has_attachments),
         }
     return out
+
+
+def _email_index_list(owner: str, account_id: str | None, folder: str, filter_: str, limit: int, offset: int, has_attachments: bool = False) -> tuple[list[dict], int, str | None]:
+    """Return a newest-first page from the durable local email index.
+
+    This is intentionally a paint-fast cache path for the UI, not the source of
+    truth. The normal IMAP list still runs after this in the browser to refresh
+    flags/new mail.
+    """
+    limit = max(1, min(int(limit or 50), 200))
+    offset = max(0, int(offset or 0))
+    account_key = _account_cache_key(account_id, owner)
+    clauses = ["owner=?", "account_key=?", "folder=?"]
+    params: list = [owner or "", account_key, folder]
+    if filter_ == "unread":
+        clauses.append("(flags IS NULL OR instr(flags, '\\Seen') = 0)")
+    elif filter_ in {"unanswered", "undone"}:
+        clauses.append("(flags IS NULL OR instr(flags, '\\Answered') = 0)")
+    elif filter_ == "favorites":
+        clauses.append("instr(COALESCE(flags, ''), '\\Flagged') > 0")
+    elif filter_ not in {"all", "", None}:
+        return [], 0, None
+    if has_attachments:
+        clauses.append("has_attachments=1")
+    where = " AND ".join(clauses)
+    try:
+        conn = _sql3.connect(SCHEDULED_DB)
+        try:
+            total_row = conn.execute(
+                f"SELECT COUNT(*), MAX(updated_at) FROM email_message_index WHERE {where}",
+                params,
+            ).fetchone()
+            total = int((total_row or [0])[0] or 0)
+            if not total:
+                return [], 0, (total_row or [None, None])[1]
+            rows = conn.execute(
+                f"""
+                SELECT uid, message_id, subject, from_name, from_address, to_text, cc_text,
+                       date_iso, date_display, date_epoch, size, flags, has_attachments
+                FROM email_message_index
+                WHERE {where}
+                ORDER BY date_epoch DESC
+                LIMIT ? OFFSET ?
+                """,
+                [*params, limit, offset],
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        logger.debug("email index list skipped", exc_info=True)
+        return [], 0, None
+
+    emails: list[dict] = []
+    for row in rows:
+        uid, message_id, subject, from_name, from_address, to_text, cc_text, date_iso, date_display, date_epoch, size, flags, has_attachments_raw = row
+        flags = flags or ""
+        emails.append({
+            "uid": str(uid),
+            "message_id": (message_id or "").strip(),
+            "subject": subject or "(no subject)",
+            "from_name": from_name or from_address or "",
+            "from_address": from_address or "",
+            "to": to_text or "",
+            "cc": cc_text or "",
+            "date": date_iso or "",
+            "date_display": date_display or "",
+            "date_epoch": float(date_epoch or 0),
+            "size": int(size or 0),
+            "is_read": "\\Seen" in flags,
+            "is_answered": "\\Answered" in flags,
+            "is_flagged": "\\Flagged" in flags,
+            "flags": flags,
+            "has_attachments": bool(has_attachments_raw),
+            "folder": folder,
+        })
+    return emails, total, (total_row or [None, None])[1]
 
 
 def _email_index_search(owner: str, account_id: str | None, folder: str, query: str, limit: int, global_search: bool = True) -> tuple[list[dict], int, str | None]:
@@ -924,29 +1325,32 @@ def _resolve_send_config(account_id: str | None = None, owner: str = "") -> dict
 
 
 def _store_email_flag(conn, uid: str, flag: str, add: bool = True) -> bool:
+    # imaplib's plain store() takes a message SEQUENCE NUMBER, not a UID, so the
+    # old `else` fallback flagged whichever message happened to occupy sequence
+    # position == the UID value. When the UID isn't present, fail safe (callers
+    # surface "Email not found") rather than touch an unrelated message.
+    if not _uid_exists(conn, uid):
+        return False
     op = "+FLAGS" if add else "-FLAGS"
-    if _uid_exists(conn, uid):
-        status, _ = conn.uid("STORE", _uid_bytes(uid), op, flag)
-    else:
-        status, _ = conn.store(_uid_bytes(uid), op, flag)
+    status, _ = conn.uid("STORE", _uid_bytes(uid), op, flag)
     return status == "OK"
 
 
 def _move_email_message(conn, uid: str, dest: str, role: str = "") -> bool:
     dest = _resolve_mail_folder(conn, dest, role or _folder_role_from_name(dest))
-    if _uid_exists(conn, uid):
-        status, _ = conn.uid("MOVE", _uid_bytes(uid), _q(dest))
-        if status == "OK":
-            return True
-        status, _ = conn.uid("COPY", _uid_bytes(uid), _q(dest))
-        if status != "OK":
-            return False
-        status, _ = conn.uid("STORE", _uid_bytes(uid), "+FLAGS", "\\Deleted")
-    else:
-        status, _ = conn.copy(_uid_bytes(uid), _q(dest))
-        if status != "OK":
-            return False
-        status, _ = conn.store(_uid_bytes(uid), "+FLAGS", "\\Deleted")
+    # copy()/store() are SEQUENCE-NUMBER commands; using them with a UID (the old
+    # `else` branch) copied + \Deleted-flagged the wrong message and then
+    # expunge() permanently removed it. There is no valid case where treating a
+    # UID as a sequence number is correct, so fail safe when the UID is absent.
+    if not _uid_exists(conn, uid):
+        return False
+    status, _ = conn.uid("MOVE", _uid_bytes(uid), _q(dest))
+    if status == "OK":
+        return True
+    status, _ = conn.uid("COPY", _uid_bytes(uid), _q(dest))
+    if status != "OK":
+        return False
+    status, _ = conn.uid("STORE", _uid_bytes(uid), "+FLAGS", "\\Deleted")
     if status == "OK":
         conn.expunge()
         return True
@@ -965,8 +1369,7 @@ def _normalize_addr_field(field: str) -> str:
     """Strip the malformed-but-common trailing/leading commas and stray
     whitespace from a To/Cc/Bcc string before it lands in the MIME header
     or the SMTP envelope. Users often paste a single address with a
-    trailing comma (e.g. `felix@pewdiepie.com,`) and most MTAs reject the
-    resulting `To: felix@pewdiepie.com,` line as a syntax error. Collapse
+    trailing comma, which most MTAs reject as a syntax error. Collapse
     any run of separator junk between addresses too."""
     if not field:
         return field

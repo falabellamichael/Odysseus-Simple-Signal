@@ -6,6 +6,8 @@ import { adjustUiScale, setUiScale } from './theme.js';
 import { registerMenuDismiss } from './escMenuStack.js';
 import { _eventShortcutKey, _matchesCombo } from './keybindMatcher.js';
 
+import { getSettings } from './appConfig.js';
+
 export { _matchesCombo } from './keybindMatcher.js';
 
 const _defaultKeybinds = {
@@ -54,8 +56,7 @@ export function initKeyboardShortcuts(modules) {
   window._odysseusKeybinds = { ..._defaultKeybinds };
 
   // Load saved keybinds
-  fetch('/api/auth/settings', { credentials: 'same-origin' })
-    .then(r => r.json())
+  getSettings()
     .then(s => { if (s.keybinds) window._odysseusKeybinds = { ..._defaultKeybinds, ...s.keybinds }; })
     .catch(() => {});
 

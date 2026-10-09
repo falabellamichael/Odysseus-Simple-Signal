@@ -65,6 +65,20 @@ def test_explicit_get_workspace_tool_name_promotes_to_agent_file_tools():
     assert intent.category == "files"
 
 
+def test_workspace_agent_requests_promote_to_shell_workspace():
+    prompts = [
+        "fix the bug in this repo",
+        "run the tests for this project",
+        "debug the server logs",
+        "run terminal-bench on this task",
+        "inspect the traceback and patch the code",
+    ]
+    for prompt in prompts:
+        intent = classify_tool_intent(prompt)
+        assert intent.needs_tools
+        assert intent.category == "workspace"
+
+
 def test_explanatory_calendar_questions_stay_plain_chat():
     assert not message_needs_tools("How do I add an entry to my calendar?")
     assert not message_needs_tools("What about the built-in Odysseus calendar, is that linked to email?")

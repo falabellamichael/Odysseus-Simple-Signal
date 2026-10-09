@@ -21,6 +21,8 @@ def _function_source(signature: str, next_marker: str) -> str:
 
 OPEN_SOURCE = _function_source("export function open(tab)", "\nexport function close()")
 CLOSE_SOURCE = _function_source("export function close()", "\n// Handle redirect back")
+LIFECYCLE_JS = (ROOT / "static/js/settings/lifecycle.js").read_text(encoding="utf-8")
+LIFECYCLE_SOURCE = LIFECYCLE_JS[LIFECYCLE_JS.index("export function showSettingsModal(modalEl)"):].replace("export function", "function")
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node binary not on PATH")
@@ -76,16 +78,21 @@ def test_chip_close_callback_cannot_hide_reopened_settings():
         globalThis.window = {};
 
         let initialized = true;
-        let _closeGen = 0;
+        const _closeGenerations = new WeakMap();
         const ADMIN_TABS = new Set();
         const initAll = () => {};
         const syncAppearanceCheckboxes = () => {};
-        const resetWindowPlacement = () => {};
+        const resetSettingsWindowPlacement = () => {};
+        const activateSettingsPanel = () => {};
+        const getActiveSettingsTab = () => 'general';
+        const onSettingsPanelActivated = () => {};
+        const isAdminManagedSettingsTab = () => false;
         const syncAdminVisibility = () => {};
         const syncAppearanceOpacity = () => {};
         const refreshAiModelEndpoints = () => {};
         """
     )
+    script += LIFECYCLE_SOURCE
     script += OPEN_SOURCE
     script += CLOSE_SOURCE
     script += textwrap.dedent(
@@ -122,6 +129,7 @@ def test_chip_close_callback_cannot_hide_reopened_settings():
         cwd=ROOT,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=30,
     )
 

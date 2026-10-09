@@ -617,7 +617,9 @@ export function wireInpaintButtons({
           const eRow = document.getElementById('ge-inpaint-edgestroke-row');
           const eSlider = document.getElementById('ge-edgestroke-slider');
           const eLabel = document.getElementById('ge-edgestroke-label');
+          const autoRow = document.getElementById('ge-inpaint-automatch-row');
           if (eRow) eRow.style.display = '';
+          if (autoRow) autoRow.style.display = '';
           if (eSlider) {
             eSlider.max = String(padPx);
             eSlider.min = String(-padPx);

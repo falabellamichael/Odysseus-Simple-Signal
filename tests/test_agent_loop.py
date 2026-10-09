@@ -13,6 +13,10 @@ _MOCKED_IMPORTS = [
 ]
 _INJECTED_IMPORT_STUBS = {}
 _PREEXISTING_AGENT_LOOP = sys.modules.get("src.agent_loop")
+_PREEXISTING_AGENT_LOOP_MODULES = {
+    name: module for name, module in sys.modules.items()
+    if name == "src.agent_loop" or name.startswith("src.agent_loop.")
+}
 
 
 def _drop_module_if_same(name, expected):
@@ -33,6 +37,7 @@ for mod in _MOCKED_IMPORTS:
         _INJECTED_IMPORT_STUBS[mod] = stub
 
 _IMPORTED_AGENT_LOOP = None
+_IMPORTED_AGENT_LOOP_MODULES = {}
 try:
     from src.agent_loop import (
         _detect_admin_intent,
@@ -44,9 +49,16 @@ try:
         _MCP_KEYWORDS,
     )
     _IMPORTED_AGENT_LOOP = sys.modules.get("src.agent_loop")
+    _IMPORTED_AGENT_LOOP_MODULES = {
+        name: module for name, module in sys.modules.items()
+        if name == "src.agent_loop" or name.startswith("src.agent_loop.")
+    }
 finally:
-    if _PREEXISTING_AGENT_LOOP is None and _IMPORTED_AGENT_LOOP is not None:
-        _drop_module_if_same("src.agent_loop", _IMPORTED_AGENT_LOOP)
+    # The split package's children also bind the temporary tool mocks. Drop
+    # only modules this import created so later loop tests load real tools.
+    for _mod, _module in reversed(list(_IMPORTED_AGENT_LOOP_MODULES.items())):
+        if _mod not in _PREEXISTING_AGENT_LOOP_MODULES:
+            _drop_module_if_same(_mod, _module)
     for _mod, _stub in _INJECTED_IMPORT_STUBS.items():
         _drop_module_if_same(_mod, _stub)
 
@@ -59,6 +71,10 @@ def test_import_stubs_do_not_leak_into_later_tests():
     assert leaked == []
     if _PREEXISTING_AGENT_LOOP is None:
         assert sys.modules.get("src.agent_loop") is not _IMPORTED_AGENT_LOOP
+    assert all(
+        name in _PREEXISTING_AGENT_LOOP_MODULES or sys.modules.get(name) is not module
+        for name, module in _IMPORTED_AGENT_LOOP_MODULES.items()
+    )
 
 
 def test_mcp_keyword_gate_matches_literal_mcp_requests():
@@ -321,17 +337,21 @@ class TestComputeFinalMetrics:
     def test_tool_events_included(self):
         events = [{"tool": "bash", "duration": 1.0}]
         texts = ["round 1 text"]
+        models = ["round-1-model"]
         m = _compute_final_metrics(**self._base_args(
             tool_events=events,
             round_texts=texts,
+            round_models=models,
         ))
         assert m["tool_events"] == events
         assert m["round_texts"] == texts
+        assert m["round_models"] == models
 
     def test_no_tool_events_excluded(self):
         m = _compute_final_metrics(**self._base_args(tool_events=[], round_texts=[]))
         assert "tool_events" not in m
         assert "round_texts" not in m
+        assert "round_models" not in m
 
 
 # ---------------------------------------------------------------------------

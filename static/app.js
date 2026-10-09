@@ -6,29 +6,36 @@ import Storage from './js/storage.js';
 import uiModule from './js/ui.js';
 import workspaceModule from './js/workspace.js';
 import fileHandlerModule from './js/fileHandler.js';
-import modelsModule from './js/models.js';
+import modelsModule from './js/models.js?v=20260715startupcalm2';
 import ragModule from './js/rag.js';
 import presetsModule from './js/presets.js';
 import searchModule from './js/search.js';
-import chatModule from './js/chat.js';
-import compareModule from './js/compare/index.js';
-import documentModule from './js/document.js';
+import chatModule from './js/chat.js?v=20260819approvalcontrol1';
+import compareModule from './js/compare/index.js?v=20260819approvalcontrol1';
+import documentModule from './js/document.js?v=20260815approvalsave1';
 import searchChatModule from './js/search-chat.js';
 import { makeWindowDraggable } from './js/windowDrag.js';
+import {
+  revealApplicationShellAfterPaint,
+  runDeferredRouteOpener,
+  deferRouteOpener,
+  settleSessionHydration
+} from './js/startupShell.js';
 import markdownModule from './js/markdown.js';
-import chatRenderer from './js/chatRenderer.js';
+import chatRenderer from './js/chatRenderer.js?v=20260819approvalcontrol1';
 import sessionModule from './js/sessions.js';
-import memoryModule from './js/memory.js';
+import memoryModule from './js/memory.js?v=20260722memoryloading1';
 import voiceRecorderModule from './js/voiceRecorder.js';
 import censorModule from './js/censor.js';
 import galleryModule from './js/gallery.js';
-import tasksModule from './js/tasks.js?v=20260630tasksactivity';
+import { UI_VIS_DEFAULT_OFF, resolveVisibility } from './js/ui_visibility.js';
+import tasksModule from './js/tasks.js?v=20260723tasksbulkfeedback1';
 import calendarModule from './js/calendar.js';
 import notesModule from './js/notes.js';
-import adminModule from './js/admin.js';
-import settingsModule from './js/settings.js';
+import adminModule from './js/admin.js?v=20260716openrouter3';
+import settingsModule from './js/settings.js?v=20260815approvalsave1';
 // Eagerly bind unified minimize/restore behavior across all tool modals.
-import './js/modalManager.js';
+import './js/modalManager.js?v=20260723compareicon2';
 // Desktop window tiling — drag a modal near an edge/corner to snap.
 import './js/tileManager.js';
 import themeModule from './js/theme.js';
@@ -43,7 +50,8 @@ import * as researchPanelModule from './js/research/panel.js?v=20260630researcht
 import ttsModule from './js/tts-ai.js';
 import spinnerModule from './js/spinner.js';
 import { initKeyboardShortcuts } from './js/keyboard-shortcuts.js';
-import { initSidebarLayout, syncRailSide } from './js/sidebar-layout.js';
+import { getSettings } from './js/appConfig.js';
+import { initSidebarLayout, syncRailSide } from './js/sidebar-layout.js?v=20260715startupclean';
 import { initSectionCollapse, initSectionDrag } from './js/section-management.js';
 import './js/effects/cursorTrail.js';
 
@@ -442,12 +450,22 @@ async function runAndroidAdbDisconnectAll() {
 // changes take effect immediately (previously cached once at page load and
 // went stale when the user changed their default model).
 let _defaultChat = null;
+try {
+  const cachedDefaultChat = JSON.parse(localStorage.getItem('odysseus-default-chat-cache') || 'null');
+  if (cachedDefaultChat && cachedDefaultChat.endpoint_url && cachedDefaultChat.model) {
+    _defaultChat = cachedDefaultChat;
+    window.__odysseusDefaultChat = cachedDefaultChat;
+  }
+} catch (_) {}
 async function _refreshDefaultChat() {
   try {
     const d = await (await fetch('/api/default-chat')).json();
     if (d && d.endpoint_url && d.model) {
       _defaultChat = d;
-      try { window.__odysseusDefaultChat = d; } catch (_) {}
+      try {
+        window.__odysseusDefaultChat = d;
+        localStorage.setItem('odysseus-default-chat-cache', JSON.stringify(d));
+      } catch (_) {}
       return d;
     }
   } catch (_) {}
@@ -462,7 +480,7 @@ async function _createDirectChatFromPreferredModel() {
 
   const pending = sessionModule.getPendingChat && sessionModule.getPendingChat();
   if (pending && pending.url && pending.modelId && pending.endpointId) {
-    sessionModule.createDirectChat(pending.url, pending.modelId, pending.endpointId);
+    sessionModule.createDirectChat(pending.url, pending.modelId, pending.endpointId, { source: pending.source || 'manual' });
     return true;
   }
 
@@ -476,7 +494,7 @@ async function _createDirectChatFromPreferredModel() {
 
   const dc = await _refreshDefaultChat();
   if (dc) {
-    sessionModule.createDirectChat(dc.endpoint_url, dc.model, dc.endpoint_id);
+    sessionModule.createDirectChat(dc.endpoint_url, dc.model, dc.endpoint_id, { source: 'default' });
     return true;
   }
 
@@ -870,6 +888,20 @@ function initializeEventListeners() {
     });
   }
 
+  // Export menu: Compact current chat context
+  const exportCompactBtn = el('export-compact-btn');
+  if (exportCompactBtn) {
+    exportCompactBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      exportMenu.classList.remove('open');
+      if (window.compactCurrentChatContext) {
+        await window.compactCurrentChatContext();
+      } else {
+        uiModule.showError('Compact action is not ready yet');
+      }
+    });
+  }
+
   // Export: PDF
   const exportPdfBtn = el('export-pdf-btn');
   if (exportPdfBtn) {
@@ -918,6 +950,18 @@ function initializeEventListeners() {
       } catch (err) {
         console.error('Save to docs failed:', err);
         uiModule.showError('Failed to save to documents');
+      }
+    });
+  }
+
+  // Export menu: Delete current chat
+  const exportDeleteBtn = el('export-delete-btn');
+  if (exportDeleteBtn) {
+    exportDeleteBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      exportMenu.classList.remove('open');
+      if (sessionModule?.deleteCurrentSessionFromTopMenu) {
+        await sessionModule.deleteCurrentSessionFromTopMenu();
       }
     });
   }
@@ -1587,12 +1631,13 @@ function initializeEventListeners() {
     '/library':  () => sessionModule && sessionModule.openLibrary && sessionModule.openLibrary(),
   };
   const _opener = _routeOpen[urlPath];
-  // Defer the opener — at this point in init, the modules whose handlers
-  // we trigger (#rail-new-session click handler, the email-section header
-  // click handler in emailInbox, sessionModule's loaded session list) are
-  // still being wired up further down in this same function. Stash the
-  // opener so it runs from sessionModule.loadSessions().finally() below.
-  if (_opener) window._odysseusRouteOpener = _opener;
+  // Defer the opener — at this point in init, the modules whose handlers we
+  // trigger (#rail-new-session click handler, the email-section header click
+  // handler in emailInbox, sessionModule) are still being wired up further
+  // down in this same function. startupShell decides when it can run: as soon
+  // as wiring completes, or — for the routes that read the session list —
+  // once /api/sessions has settled.
+  deferRouteOpener(urlPath, _opener);
 
   // Archive browser tool button
   const toolLibraryBtn = el('tool-library-btn');
@@ -1609,6 +1654,7 @@ function initializeEventListeners() {
   if (libraryNewDocBtn) {
     libraryNewDocBtn.addEventListener('click', async (e) => {
       e.stopPropagation();
+      if (libraryNewDocBtn.dataset.docNewWired === '1') return;
       try {
         if (documentModule && documentModule.newDocument) await documentModule.newDocument();
       } catch (err) {
@@ -1882,13 +1928,11 @@ function initializeEventListeners() {
     })
     .catch(() => {});
 
-  // Hide Gallery when image generation is disabled in settings
-  const _prefetchedSettings = sessionStorage.getItem('ody-prefetch-settings');
-  sessionStorage.removeItem('ody-prefetch-settings');
-  window._initSettingsReady = (_prefetchedSettings
-    ? Promise.resolve(JSON.parse(_prefetchedSettings))
-    : fetch(`${API_BASE}/api/auth/settings`, { credentials: 'same-origin' }).then(r => r.json())
-  ).then(settings => {
+  // Hide Gallery when image generation is disabled in settings.
+  // getSettings() consumes the login prefetch itself, so every other module
+  // that asks for settings this load gets the same snapshot without a request.
+  window._initSettingsReady = getSettings()
+    .then(settings => {
       // NOTE: image_gen_enabled only governs *generating* images in chat — the
       // tool is blocked server-side (chat_routes / agent_loop). The Gallery
       // holds uploads and past images too, so it stays visible regardless;
@@ -2061,11 +2105,19 @@ function initializeEventListeners() {
   
   const newMemoryInput = el('new-memory-input');
   if (newMemoryInput) {
-    newMemoryInput.addEventListener('keypress', (e) => {
-      if (e.key === 'Enter') {
+    // keydown, not the deprecated keypress: keypress is not guaranteed to
+    // fire for Enter everywhere, which left the Add Memory form with no
+    // working submit path (#5828).
+    newMemoryInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.isComposing) {
+        e.preventDefault();
         memoryModule.addNewMemory();
       }
     });
+  }
+  const newMemoryAddBtn = el('new-memory-add-btn');
+  if (newMemoryAddBtn) {
+    newMemoryAddBtn.addEventListener('click', () => memoryModule.addNewMemory());
   }
 
 // Voice recording is handled by the dual-purpose send/mic button (see below)
@@ -2111,6 +2163,42 @@ function initializeEventListeners() {
     uiModule.showToast(`${label} ${active ? 'on' : 'off'}`, 1800);
   }
 
+  function syncPlanToggle(active) {
+    const btn = el('plan-toggle-btn');
+    const chk = el('plan-toggle');
+    const status = el('plan-mode-status');
+    const statusToggle = el('plan-mode-status-toggle');
+    if (chk) chk.checked = !!active;
+    document.body.classList.toggle('plan-mode-active', !!active);
+    if (status) status.hidden = !active;
+    if (statusToggle) {
+      statusToggle.setAttribute('aria-pressed', String(!!active));
+      statusToggle.setAttribute('aria-label', active ? 'Turn off plan mode' : 'Turn on plan mode');
+    }
+    if (btn) {
+      btn.classList.toggle('active', !!active);
+      btn.setAttribute('aria-pressed', String(!!active));
+      btn.title = active
+        ? 'Plan mode on - next message proposes a plan only'
+        : 'Plan mode';
+    }
+  }
+
+  function setPlanMode(active, options = {}) {
+    const on = !!active;
+    const st = loadToggleState();
+    st.plan_mode = on;
+    saveToggleState(st);
+    syncPlanToggle(on);
+    if (on) {
+      const resChk = el('research-toggle');
+      if (resChk && resChk.checked) _syncResearchIndicator(false);
+    }
+    if (!options.silent && uiModule?.showToast) {
+      uiModule.showToast(on ? 'Plan mode on' : 'Plan mode off', 1600);
+    }
+  }
+
   function applyModeToToggles(mode) {
     MODE_TOOLS.forEach(({ btnId, checkboxId, stateKey }) => {
       const btn = el(btnId);
@@ -2129,8 +2217,8 @@ function initializeEventListeners() {
     });
   }
 
-  // ── Agent / Chat mode toggle ──
-  (function initModeToggle() {
+	  // ── Agent / Chat mode toggle ──
+	  (function initModeToggle() {
     const agentBtn = el('mode-agent-btn');
     const chatBtn = el('mode-chat-btn');
     if (!agentBtn || !chatBtn) return;
@@ -2168,7 +2256,61 @@ function initializeEventListeners() {
       setMode('agent');
     });
     chatBtn.addEventListener('click', () => setMode('chat'));
-    setMode(currentMode);
+	    setMode(currentMode);
+	  })();
+
+  (function initPlanToggle() {
+    const btn = el('plan-toggle-btn');
+    const state = loadToggleState();
+    syncPlanToggle(!!state.plan_mode);
+    window.__odysseusSetPlanMode = (active) => setPlanMode(active, { silent: true });
+    const statusToggle = el('plan-mode-status-toggle');
+    if (btn) {
+      btn.addEventListener('click', () => {
+        const st = loadToggleState();
+        setPlanMode(!st.plan_mode);
+      });
+    }
+    if (statusToggle) {
+      statusToggle.addEventListener('click', () => setPlanMode(false));
+    }
+    const msgInput = el('message');
+    if (msgInput && !msgInput._odysseusPlanTabToggle) {
+      msgInput._odysseusPlanTabToggle = true;
+      msgInput.addEventListener('keydown', (e) => {
+        if (e.key !== 'Tab' || e.shiftKey || e.altKey || e.ctrlKey || e.metaKey || e.isComposing) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const st = loadToggleState();
+        setPlanMode(!st.plan_mode);
+      });
+    }
+    const chatBar = document.querySelector('.chat-input-bar');
+    if (chatBar && !chatBar._odysseusPlanSwipeToggle) {
+      chatBar._odysseusPlanSwipeToggle = true;
+      let touchStartX = 0;
+      let touchStartY = 0;
+      let touchStartAt = 0;
+      chatBar.addEventListener('touchstart', (e) => {
+        if (!e.touches || e.touches.length !== 1) return;
+        const t = e.touches[0];
+        touchStartX = t.clientX;
+        touchStartY = t.clientY;
+        touchStartAt = Date.now();
+      }, { passive: true });
+      chatBar.addEventListener('touchend', (e) => {
+        if (!touchStartAt || !e.changedTouches || e.changedTouches.length !== 1) return;
+        if (!window.matchMedia || !window.matchMedia('(max-width: 768px)').matches) return;
+        const t = e.changedTouches[0];
+        const dx = t.clientX - touchStartX;
+        const dy = t.clientY - touchStartY;
+        const dt = Date.now() - touchStartAt;
+        touchStartAt = 0;
+        if (dt > 700 || Math.abs(dx) < 56 || Math.abs(dy) > 28 || Math.abs(dx) < Math.abs(dy) * 2) return;
+        const st = loadToggleState();
+        setPlanMode(!st.plan_mode);
+      }, { passive: true });
+    }
   })();
 
   // ── Tool splash explainer messages (shown first 2 times per tool) ──
@@ -2672,21 +2814,43 @@ function initializeEventListeners() {
     const PLACEHOLDER_COMPACT_WIDTH = 400;
     const PICKER_HIDE_WIDTH = 220;
     const TOOLBAR_HIDE_WIDTH = 160;
-    const textarea = el('message');
-    const inputBottom = document.querySelector('.chat-input-bottom');
-    const _isMobile = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+	    const textarea = el('message');
+	    const inputBottom = document.querySelector('.chat-input-bottom');
+	    const _isMobile = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+	    let _placeholderHintOn = false;
 
-    function checkPickerOverflow() {
-      // Skip responsive collapse on mobile — keyboard open/close causes flicker
-      if (_isMobile) return;
-      const w = inputTop.clientWidth;
-      // Hide model picker
-      pickerWrap.classList.toggle('picker-auto-hidden', w < PICKER_HIDE_WIDTH);
-      // Keep a prompt inside the composer even when the picker crowds the row.
-      // A blank placeholder makes the mobile/compact empty state feel broken.
-      if (textarea) {
-        textarea.setAttribute('placeholder', w < PLACEHOLDER_COMPACT_WIDTH ? 'Message...' : 'Message Odysseus...');
-      }
+	    function setComposerPlaceholder(width) {
+	      if (!textarea) return;
+	      if (_isMobile && _placeholderHintOn) {
+	        textarea.setAttribute('placeholder', 'Swipe to toggle plan');
+	        return;
+	      }
+	      textarea.setAttribute('placeholder', width < PLACEHOLDER_COMPACT_WIDTH ? 'Message...' : 'Message Odysseus...');
+	    }
+
+	    if (_isMobile && textarea && !textarea._odysseusPlanPlaceholderHint) {
+	      textarea._odysseusPlanPlaceholderHint = true;
+	      setInterval(() => {
+	        _placeholderHintOn = !_placeholderHintOn;
+	        setComposerPlaceholder(inputTop.clientWidth || window.innerWidth || 0);
+	      }, 5000);
+	    }
+
+		    function checkPickerOverflow() {
+		      const w = inputTop.clientWidth || window.innerWidth || 0;
+		      const hasText = !!(textarea && textarea.value && textarea.value.trim());
+		      if (_isMobile) {
+		        // Mobile has much less horizontal room: any typed text should get
+		        // the full composer row, matching plan-mode's collision behavior.
+		        pickerWrap.classList.toggle('picker-auto-hidden', hasText);
+		        setComposerPlaceholder(w);
+		        return;
+		      }
+		      // Hide model picker
+		      pickerWrap.classList.toggle('picker-auto-hidden', w < PICKER_HIDE_WIDTH);
+	      // Keep a prompt inside the composer even when the picker crowds the row.
+	      // A blank placeholder makes the mobile/compact empty state feel broken.
+	      setComposerPlaceholder(w);
       // Hide entire bottom toolbar (tools, mode toggle) — only send button remains
       if (inputBottom) {
         inputBottom.classList.toggle('toolbar-auto-hidden', w < TOOLBAR_HIDE_WIDTH);
@@ -2852,6 +3016,11 @@ function initializeEventListeners() {
       incognitoBtn.title = chk.checked ? 'Disable Nobody mode' : 'Enable Nobody mode — no memory, no history saved';
       const welcomeName = document.querySelector('.welcome-name');
       if (chk.checked) {
+        try {
+          if (sessionModule && sessionModule.setCurrentSessionId) sessionModule.setCurrentSessionId(null);
+          const box = el('chat-history');
+          if (box) box.innerHTML = '';
+        } catch (_) {}
         incognitoBtn.innerHTML = INCOGNITO_EYE_CLOSED + '<span class="incognito-label">Nobody</span>';
         if (welcomeName) {
           welcomeName.dataset.originalHtml = welcomeName.innerHTML;
@@ -2975,48 +3144,6 @@ function initializeEventListeners() {
   // ── UI Visibility (Customize UI modal) ──
   const UI_VIS_KEY = 'odysseus-ui-visibility';
 
-  // Selector map: key → CSS selector(s) for targets
-  const UI_VIS_MAP = {
-    'sidebar-brand':       '.sidebar-brand-title',
-    'sidebar-new-chat':    '#sidebar-new-chat-btn',
-    'sidebar-search':      '#sidebar-search-btn',
-    'sessions-section':    '#sessions-section',
-    'email-section':       '#email-section',
-    'models-section':      '#models-section',
-    'tools-section':       '#tools-section',
-    // Per-tool visibility — fine-grained control over which entries show
-    // inside the Tools section in the sidebar.
-    'tool-calendar':       '#tool-calendar-btn',
-    'tool-compare':        '#tool-compare-btn',
-    'tool-cookbook':       '#tool-cookbook-btn',
-    'tool-research':       '#tool-research-btn',
-    'tool-gallery':        '#tool-gallery-btn',
-    'tool-library':        '#tool-library-btn',
-    'tool-memory':         '#tool-memory-btn',
-    'tool-notes':          '#tool-notes-btn',
-    'tool-tasks':          '#tool-tasks-btn',
-    'tool-connect':        '#tool-connect-btn, #rail-connect',
-    'tool-theme':          '#tool-theme-btn',
-    'user-bar':            '#user-bar-profile',
-    'sidebar-settings-btn':'#user-bar-settings',
-    'chat-meta':           '.chat-meta-overlay',
-    'welcome-text':        '.welcome-name, .welcome-sub, #welcome-tip',
-    'incognito-btn':       '.incognito-btn',
-    'web-toggle-btn':      '#web-toggle-btn',
-    'doc-toggle-btn':      '#overflow-doc-btn',
-    'rag-toggle-btn':      '#overflow-rag-btn',
-    'bash-toggle-btn':     '#bash-toggle-btn',
-    'overflow-plus-btn':   '.overflow-wrapper',
-    'mode-toggle':         '.mode-toggle',
-    'preset-mini-btn':     '#overflow-preset-btn',
-    'attach-btn':          '#overflow-attach-btn',
-    'research-btn':        '#overflow-research-btn',
-    'rail-new-chat':       '#rail-new-session',
-  };
-
-  // Keys hidden by default on first run (no localStorage yet)
-  const UI_VIS_DEFAULT_OFF = new Set(['models-section', 'rag-toggle-btn', 'text-emojis', 'chat-fullwidth']);
-
   // Keys that need admin to toggle off (reserved for future use)
   const UI_VIS_ADMIN_ONLY = new Set([]);
 
@@ -3029,14 +3156,14 @@ function initializeEventListeners() {
   }
 
   function applyUIVis(state) {
-    Object.entries(UI_VIS_MAP).forEach(([key, selector]) => {
-      // section-drag-reorder uses a body class instead of inline styles
-      if (key === 'section-drag-reorder') return;
-      let visible = key in state ? state[key] !== false : !UI_VIS_DEFAULT_OFF.has(key);
+    // resolveVisibility computes selector→visible (pure; ui_visibility.js),
+    // including the tools-section parent rule that hides every tool rail
+    // launcher when Tools is off. Apply the result to the DOM here.
+    for (const [selector, visible] of Object.entries(resolveVisibility(state))) {
       document.querySelectorAll(selector).forEach(el => {
         el.style.display = visible ? '' : 'none';
       });
-    });
+    }
     // Drag reorder: use body class so dynamically created handles are covered
     const dragEnabled = state['section-drag-reorder'] === true;
     document.body.classList.toggle('rearrange-mode', dragEnabled);
@@ -3543,7 +3670,7 @@ function initializeEventListeners() {
       ['.memory-tabs', '.memory-tab'],
       ['.admin-tabs', '.admin-tab'],
     ];
-    const _IGNORE = 'input, textarea, select, [contenteditable="true"], .preset-range, ' +
+    const _IGNORE = '.chat-input-bar, input, textarea, select, [contenteditable="true"], .preset-range, ' +
       '.note-cl-row, .minimized-dock-chip, canvas, .email-card-reader';
     let sx = 0, sy = 0, tracking = false;
 
@@ -3969,6 +4096,7 @@ function initializeEventListeners() {
 // INITIALIZATION ON PAGE LOAD
 // ============================================
 function startOdysseusApp() {
+  tasksModule?.startNotificationPolling?.();
   if (window.__odysseusAppStarted) return;
   window.__odysseusAppStarted = true;
   const _bumpChatPriority = (ms = 10000) => {
@@ -4012,7 +4140,7 @@ function startOdysseusApp() {
   modelsModule.init(API_BASE);
   ragModule.init(API_BASE);
   presetsModule.init(API_BASE);
-  searchModule.init(API_BASE);
+  searchModule.init();
   chatModule.init(API_BASE);
   chatModule.initListeners();
   groupModule.init(API_BASE);
@@ -4187,6 +4315,7 @@ function startOdysseusApp() {
       return;
     }
 
+    chatRenderer.hideWelcomeScreen();
     return originalSubmit.call(chatModule, e);
   }
 
@@ -4196,6 +4325,11 @@ function startOdysseusApp() {
   const sendBtn = document.querySelector('.send-btn');
   const messageInput = el('message');
   const modelPickerWrap = document.getElementById('model-picker-wrap');
+
+  // ArrowUp/ArrowDown prompt recall on #message lives in
+  // static/js/composerArrowUpRecall.js (wired from chat.js). Do not re-add a
+  // copy here: two capture-phase listeners on the same textarea meant the one
+  // without the draft guard won and ate unsent multi-line prompts (#5862).
 
   const _sendIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>';
   const _micIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>';
@@ -4406,13 +4540,18 @@ function startOdysseusApp() {
   // Toggle mic/send icon on input change + hide model picker after enough text
   if (messageInput) {
     const _debouncedUpdateIcon = uiModule.debounce(_updateSendBtnIcon, 50);
-    const _MODEL_PICKER_HIDE_CHARS = 10;
-    const _syncModelPickerAutohide = () => {
-      const hidePicker = (messageInput.value || '').replace(/\s/g, '').length >= _MODEL_PICKER_HIDE_CHARS;
-      if (modelPickerWrap) {
-        modelPickerWrap.classList.toggle('model-picker-autohide', hidePicker);
-      }
-    };
+		    const _MODEL_PICKER_HIDE_CHARS = 23;
+		    const _syncModelPickerAutohide = () => {
+		      const compactMobile = _isMobileChatInput() && !!(messageInput.value || '').trim();
+		      const hidePicker = compactMobile || (messageInput.value || '').replace(/\s/g, '').length >= _MODEL_PICKER_HIDE_CHARS;
+		      if (modelPickerWrap) {
+		        modelPickerWrap.classList.toggle('model-picker-autohide', hidePicker);
+		      }
+	      const planStatus = el('plan-mode-status');
+	      if (planStatus) {
+	        planStatus.classList.toggle('plan-mode-status-autohide', hidePicker);
+	      }
+	    };
     window._syncModelPickerAutohide = _syncModelPickerAutohide;
     _syncModelPickerAutohide();
     messageInput.addEventListener('input', () => {
@@ -4588,6 +4727,10 @@ function startOdysseusApp() {
   // Load initial data
   presetsModule.loadPresets(uiModule.showError);
 
+  // Core wiring is complete for this turn — reveal the shell independently of
+  // the session-list request.
+  revealApplicationShellAfterPaint();
+
   if (sessionModule) {
     sessionModule.initDependencies({
       API_BASE: API_BASE,
@@ -4599,21 +4742,19 @@ function startOdysseusApp() {
       scrollHistory: uiModule.scrollHistoryInstant
     });
 
-    // Load sessions first (critical path) — remove loader when done
-    sessionModule.loadSessions()
-      .catch(e => console.warn('loadSessions error:', e))
-      .finally(() => {
-        const loader = document.getElementById('app-loader');
-        if (loader) { loader.style.opacity = '0'; setTimeout(() => loader.remove(), 300); }
-        // Fire any URL route opener now that sessions + module wiring are
-        // ready. Deferred from up top of init for exactly this reason.
-        if (window._odysseusRouteOpener) {
-          try { window._odysseusRouteOpener(); } catch (_) {}
-          window._odysseusRouteOpener = null;
-        }
-      });
+    // sessionModule is now wired, so every route opener has the modules it
+    // drives. The ones that read no session data open here rather than
+    // queueing behind /api/sessions.
+    runDeferredRouteOpener();
+
+    // The shell is already usable at this point; session hydration is
+    // sidebar-local and settles on its own schedule.
+    settleSessionHydration(() => sessionModule.loadSessions());
   } else {
     console.error('Session module not loaded!');
+    // Nothing will hydrate. Settle immediately so the sidebar exposes the
+    // failure; session-dependent routes must remain unopened without data.
+    settleSessionHydration(null);
   }
 
   const runNonCriticalStartup = (fn, delay = 4000) => {
@@ -4640,7 +4781,6 @@ function startOdysseusApp() {
 
   // Non-critical startup work must not compete with first paint, chat send, or
   // chat switching. Panels load their own data when opened; these are only warmups.
-  _syncWelcomeModelHint().catch(() => {});
   runNonCriticalStartup(() => {
     modelsModule.refreshModels(false).then(() => {
       try { sessionModule.updateModelPicker(); } catch (_) {}
@@ -4649,14 +4789,112 @@ function startOdysseusApp() {
   }, 3500);
   runNonCriticalStartup(() => modelsModule.refreshProviders(), 6500);
   runNonCriticalStartup(() => ragModule.loadPersonalDocs(), 9000);
-  runNonCriticalStartup(() => memoryModule.loadMemories(), 12000);
-  
-  // Ensure proper initial state
-  voiceRecorderModule.init();
-  if (censorModule) censorModule.init();
+	  runNonCriticalStartup(() => memoryModule.loadMemories(), 12000);
 
-  // Auto-focus message input on load
-  const msgEl = document.getElementById('message');
+	  // Ensure proper initial state
+	  voiceRecorderModule.init();
+	  if (censorModule) censorModule.init();
+
+	  // ── Mobile pull-to-refresh for the active chat ──
+	  (function initMobileChatPullRefresh() {
+	    const historyEl = document.getElementById('chat-history');
+	    const container = document.getElementById('chat-container');
+	    if (!historyEl || !container || !('ontouchstart' in window || navigator.maxTouchPoints > 0)) return;
+
+	    const THRESHOLD = 72;
+	    const MAX_PULL = 104;
+	    let startY = 0;
+	    let pullY = 0;
+	    let tracking = false;
+	    let refreshing = false;
+	    let spinner = null;
+	    const indicator = document.createElement('div');
+	    indicator.className = 'chat-pull-refresh';
+	    indicator.setAttribute('aria-hidden', 'true');
+	    indicator.innerHTML = '<div class="chat-pull-refresh-spinner"></div>';
+	    container.prepend(indicator);
+	    const spinnerMount = indicator.querySelector('.chat-pull-refresh-spinner');
+	    try {
+	      spinner = spinnerModule.createWhirlpool(18);
+	      spinnerMount.replaceChildren(spinner.element);
+	    } catch (_) {}
+
+	    function setPull(px, active = false) {
+	      pullY = Math.max(0, Math.min(MAX_PULL, px));
+	      const pct = Math.min(1, pullY / THRESHOLD);
+	      indicator.style.setProperty('--pull-refresh-y', `${pullY}px`);
+	      indicator.style.setProperty('--pull-refresh-progress', `${pct}`);
+	      indicator.classList.toggle('is-visible', active || refreshing || pullY > 2);
+	      indicator.classList.toggle('is-ready', pct >= 1 && !refreshing);
+	      indicator.classList.toggle('is-refreshing', refreshing);
+	    }
+
+	    async function runRefresh() {
+	      if (refreshing) return;
+	      if (_isForegroundChatBusy()) {
+	        setPull(0, false);
+	        return;
+	      }
+	      refreshing = true;
+	      setPull(THRESHOLD, true);
+	      const safetyTimer = setTimeout(() => {
+	        refreshing = false;
+	        setPull(0, false);
+	      }, 8000);
+	      try {
+	        const sid = sessionModule && sessionModule.getCurrentSessionId && sessionModule.getCurrentSessionId();
+	        if (sid && sessionModule.selectSession) {
+	          await sessionModule.selectSession(sid, { keepSidebar: true, showLoading: false, immediateLoading: true });
+	        } else if (sessionModule && sessionModule.loadSessions) {
+	          await sessionModule.loadSessions();
+	        }
+	      } catch (err) {
+	        console.warn('pull refresh failed:', err);
+	      } finally {
+	        clearTimeout(safetyTimer);
+	        refreshing = false;
+	        setPull(0, false);
+	      }
+	    }
+
+	    historyEl.addEventListener('touchstart', (e) => {
+	      if (refreshing || window.innerWidth > 768) return;
+	      if (document.querySelector('.modal:not(.hidden)')) return;
+	      if (historyEl.scrollTop > 0) return;
+	      if (e.target && e.target.closest && e.target.closest('.chat-input-bar, textarea, input, button, select, a')) return;
+	      tracking = true;
+	      startY = e.touches[0].clientY;
+	      setPull(0, false);
+	    }, { passive: true });
+
+	    historyEl.addEventListener('touchmove', (e) => {
+	      if (!tracking || refreshing) return;
+	      const dy = e.touches[0].clientY - startY;
+	      if (dy <= 0) {
+	        setPull(0, false);
+	        return;
+	      }
+	      if (historyEl.scrollTop <= 0) {
+	        e.preventDefault();
+	        setPull(dy * 0.62, true);
+	      }
+	    }, { passive: false });
+
+	    historyEl.addEventListener('touchend', () => {
+	      if (!tracking) return;
+	      tracking = false;
+	      if (pullY >= THRESHOLD) runRefresh();
+	      else setPull(0, false);
+	    }, { passive: true });
+
+	    historyEl.addEventListener('touchcancel', () => {
+	      tracking = false;
+	      if (!refreshing) setPull(0, false);
+	    }, { passive: true });
+	  })();
+
+	  // Auto-focus message input on load
+	  const msgEl = document.getElementById('message');
   if (msgEl) msgEl.focus();
   
   // Initialize mouse-based drag for sidebar sections

@@ -13,11 +13,13 @@ import email as email_mod
 import email.header
 import email.utils
 import smtplib
+import ssl
 import json
 import re
 import html
 import io
 import zipfile
+from urllib.parse import parse_qs, unquote, urlparse
 from html.parser import HTMLParser as _HTMLParser
 import logging
 import uuid
@@ -36,10 +38,12 @@ from src.upload_limits import read_upload_limited, EMAIL_COMPOSE_UPLOAD_MAX_BYTE
 
 from routes.email_helpers import (
     _strip_think, _extract_reply, _apply_email_style_mechanics, require_owner, require_user, _assert_owns_account,
+    _account_visible_to_owner,
     _q, _attach_compose_uploads, _cleanup_compose_uploads,
     _load_settings, _save_settings, _get_email_config,
     _send_smtp_message, _smtp_security_mode,
     _IMAP_TIMEOUT_SECONDS, _open_imap_connection, _normalize_imap_starttls,
+    _get_valid_google_token, _xoauth2_bytes, _xoauth2_raw,
     make_oauth_state, verify_oauth_state,
     EmailNotConfiguredError,
     _imap_connect, _imap, _decode_header, _detect_sent_folder, _detect_drafts_folder,
@@ -47,7 +51,8 @@ from routes.email_helpers import (
     _extract_attachment_to_disk, _extract_html, _extract_text,
     _fetch_sender_thread_context, _pre_retrieve_context,
     _EMAIL_REPLY_SYS_PROMPT_BASE, _POOL_HOOKS,
-    _friendly_email_auth_error,
+    _friendly_email_auth_error, _email_summary_failure_log_detail,
+    _generate_email_summary, EMAIL_SUMMARY_ERROR_CODE, EMAIL_SUMMARY_ERROR_MESSAGE,
     SendEmailRequest, ExtractStyleRequest,
     ATTACHMENTS_DIR, COMPOSE_UPLOADS_DIR, SCHEDULED_DB,
     attachment_extract_dir, _email_cache_owner_clause, email_translation_body_hash,
@@ -107,6 +112,14 @@ logger = logging.getLogger(__name__)
 
 ODYSSEUS_MAIL_ORIGIN = "odysseus-ui"
 EMAIL_READ_ATTACHMENT_VERSION = 2
+_GOOGLE_OAUTH_IMAP_HOST = "imap.gmail.com"
+_GOOGLE_OAUTH_SMTP_HOST = "smtp.gmail.com"
+_SERVER_OWNED_OAUTH_FIELDS = {
+    "oauth_provider",
+    "oauth_access_token",
+    "oauth_refresh_token",
+    "oauth_token_expiry",
+}
 
 
 def _read_cache_key(account_id, folder, uid, owner=""):
@@ -121,6 +134,24 @@ def _read_cache_get(key):
     """Read through the currently configured email router cache, if available."""
     callback = _POOL_HOOKS.get("read_cache_get")
     return callback(key) if callback is not None else None
+
+
+from routes.email._utils import (
+    _dedupe_unsubscribe_candidates,
+    _discover_email_account_mutation_scope,
+    _email_account_owner_scope,
+    _email_index_list,
+    _email_unsubscribe_candidate_from_msg,
+    _get_auto_reply_settings_for_account,
+    _get_email_writing_style_for_account,
+    _google_oauth_imap_transport_allowed,
+    _google_oauth_smtp_transport_allowed,
+    _lock_and_reload_email_account,
+    _lock_email_account_owner_mutation,
+    _normalized_mail_host,
+    _set_auto_reply_settings_for_account,
+    _set_email_writing_style_for_account,
+)
 
 
 def setup_email_routes():
@@ -152,7 +183,7 @@ def setup_email_routes():
     _IMAP_POOL = {}   # account_id → (conn, last_used_at)
     _IMAP_IDLE_MAX = 60.0
     _WARMING_READS = set()
-    _WARM_READ_LIMIT = 2
+    _WARM_READ_LIMIT = 6
     _WARM_MAX_BYTES = 192 * 1024
     _WARM_RECENT_SECONDS = 7 * 24 * 60 * 60
     _pool_lock = _threading.Lock()
@@ -234,6 +265,10 @@ def setup_email_routes():
             _FOLDER_CACHE.pop(key, None)
             return None
         return v[1]
+
+    def _folder_cache_get_stale(account_id, owner):
+        v = _FOLDER_CACHE.get((account_id or "", owner or ""))
+        return v[1] if v else None
 
     def _folder_cache_put(account_id, owner, value):
         _FOLDER_CACHE[(account_id or "", owner or "")] = (_time.monotonic() + _FOLDER_TTL, value)
@@ -943,18 +978,44 @@ def setup_email_routes():
         from_addr: str | None = Query(None, alias="from"),
         account_id: str | None = Query(None),
         has_attachments: int = Query(0),
+        cached_only: int = Query(0),
         cache_bust: str | None = Query(None, alias="_"),
         owner: str = Depends(require_owner),
     ):
         """List emails. Uses an 8s in-memory cache + offloads blocking IMAP
         calls to a worker thread so the event loop never stalls."""
         started_at = _time.monotonic()
-        _deferred = getattr(_start_poller, '_deferred', None)
-        if _deferred:
-            await _deferred()
         fixture_result = _fixture_email_list(folder, limit, offset, filter, from_addr, owner)
         if fixture_result is not None:
             return fixture_result
+        if cached_only and not from_addr:
+            indexed_emails, indexed_total, indexed_at = _email_index_list(
+                owner, account_id, folder, filter, limit, offset, bool(has_attachments),
+            )
+            if indexed_total:
+                _hide_unlinked_calendar_tags(indexed_emails)
+                return {
+                    "emails": indexed_emails,
+                    "total": indexed_total,
+                    "folder": folder,
+                    "offset": offset,
+                    "sync": {
+                        "source": "index",
+                        "indexed": indexed_total,
+                        "updated_at": indexed_at,
+                        "cached_only": True,
+                    },
+                }
+            return {
+                "emails": [],
+                "total": 0,
+                "folder": folder,
+                "offset": offset,
+                "sync": {"source": "index", "cached_only": True},
+            }
+        _deferred = getattr(_start_poller, '_deferred', None)
+        if _deferred:
+            await _deferred()
         # SECURITY: include `owner` in the cache key so two users with
         # different account scopes don't share a cached list.
         ck = _list_cache_key(account_id, folder, filter, limit, offset, from_addr or "") + (int(bool(has_attachments)), owner)
@@ -1081,6 +1142,230 @@ def setup_email_routes():
         except Exception as e:
             logger.error(f"unflag-spam failed: {e}")
             return {"ok": False, "error": "Mail operation failed"}
+
+    def _unsubscribe_spam_cache(owner: str, account_id: str | None, folder: str) -> dict[str, dict]:
+        out: dict[str, dict] = {}
+        try:
+            conn = _sql3.connect(SCHEDULED_DB)
+            try:
+                owner_clause, owner_params = _email_tag_owner_clause(account_id, owner)
+                account_clause, account_params = _email_tag_account_clause(account_id)
+                rows = conn.execute(
+                    "SELECT uid, message_id, spam_verdict, spam_reason FROM email_tags "
+                    "WHERE folder=? AND "
+                    f"{owner_clause} AND {account_clause}",
+                    (folder, *owner_params, *account_params),
+                ).fetchall()
+            finally:
+                conn.close()
+            for uid, message_id, spam_verdict, spam_reason in rows:
+                payload = {"spam": bool(spam_verdict), "reason": spam_reason or ""}
+                if uid:
+                    out[str(uid)] = payload
+                if message_id:
+                    out[str(message_id).strip()] = payload
+        except Exception:
+            logger.debug("unsubscribe spam cache lookup skipped", exc_info=True)
+        return out
+
+    def _scan_unsubscribe_candidates_sync(folder: str, account_id: str | None, owner: str, limit: int, max_scan: int) -> dict:
+        folder = folder or "INBOX"
+        limit = max(1, min(int(limit or 25), 100))
+        max_scan = max(limit, min(int(max_scan or 150), 500))
+        spam_cache = _unsubscribe_spam_cache(owner, account_id, folder)
+        candidates: list[dict] = []
+        with _imap(account_id, owner=owner) as conn:
+            st, _ = conn.select(_q(folder), readonly=True)
+            if st != "OK":
+                return {"success": False, "error": f"Folder not found: {folder}", "candidates": []}
+            st, data = _imap_uid_search(conn, "ALL")
+            if st != "OK" or not data or not data[0]:
+                return {"success": True, "candidates": [], "total": 0, "scanned": 0, "folder": folder}
+            uids = []
+            for raw_uid in data[0].split():
+                try:
+                    uids.append(int(raw_uid))
+                except Exception:
+                    continue
+            uids = sorted(uids, reverse=True)[:max_scan]
+            if not uids:
+                return {"success": True, "candidates": [], "total": 0, "scanned": 0, "folder": folder}
+            fetch_set = ",".join(str(u) for u in uids)
+            st, msg_data = _imap_uid_fetch(conn, fetch_set, "(UID RFC822.HEADER)")
+            if st != "OK":
+                return {"success": False, "error": "Failed to fetch email headers", "candidates": []}
+        for item in msg_data or []:
+            if not isinstance(item, tuple) or len(item) < 2:
+                continue
+            meta_b = item[0] if isinstance(item[0], bytes) else str(item[0]).encode()
+            uid = _uid_from_fetch_meta(meta_b)
+            if not uid:
+                continue
+            try:
+                msg = email_mod.message_from_bytes(item[1] or b"")
+            except Exception:
+                continue
+            mid = (msg.get("Message-ID") or "").strip()
+            spam_info = spam_cache.get(uid) or (spam_cache.get(mid) if mid else None) or {}
+            candidate = _email_unsubscribe_candidate_from_msg(msg, uid, folder, spam_cached=spam_info)
+            if candidate:
+                candidates.append(candidate)
+        def _uid_sort_value(candidate: dict) -> int:
+            try:
+                return int(candidate.get("uid") or 0)
+            except Exception:
+                return 0
+        raw_total = len(candidates)
+        candidates = _dedupe_unsubscribe_candidates(candidates)
+        candidates.sort(key=lambda c: (int(c.get("score") or 0), int(c.get("duplicate_count") or 1), _uid_sort_value(c)), reverse=True)
+        return {
+            "success": True,
+            "candidates": candidates[:limit],
+            "total": len(candidates),
+            "raw_total": raw_total,
+            "scanned": len(uids),
+            "folder": folder,
+            "account_id": account_id or "",
+        }
+
+    @router.get("/unsubscribe/scan")
+    async def scan_unsubscribe_candidates(
+        folder: str = Query("INBOX"),
+        account_id: str | None = Query(None),
+        limit: int = Query(25),
+        max_scan: int = Query(150),
+        owner: str = Depends(require_owner),
+    ):
+        """Review-only scan for spam/newsletter unsubscribe candidates."""
+        if account_id:
+            _assert_owns_account(account_id, owner)
+        if _fixture_email_enabled():
+            return {"success": True, "candidates": [], "total": 0, "scanned": 0, "folder": folder, "sync": {"source": "fixture"}}
+        try:
+            return await _asyncio.to_thread(_scan_unsubscribe_candidates_sync, folder, account_id, owner, limit, max_scan)
+        except Exception as e:
+            logger.error(f"unsubscribe scan failed: {e}")
+            return {"success": False, "error": "Mail operation failed", "candidates": []}
+
+    @router.post("/unsubscribe/execute")
+    def execute_unsubscribe(data: dict, owner: str = Depends(require_owner)):
+        """Execute an approved unsubscribe action.
+
+        First implementation supports mailto List-Unsubscribe only. The message
+        header is re-read server-side; client-supplied addresses are not trusted.
+        """
+        uid = str((data or {}).get("uid") or "").strip()
+        folder = str((data or {}).get("folder") or "INBOX").strip() or "INBOX"
+        account_id = (data or {}).get("account_id") or None
+        method_index = int((data or {}).get("method_index") or 0)
+        move_to_spam = bool((data or {}).get("move_to_spam"))
+        if not uid:
+            raise HTTPException(400, "Missing uid")
+        if account_id:
+            _assert_owns_account(account_id, owner)
+        try:
+            with _imap(account_id, owner=owner) as conn:
+                st, _ = conn.select(_q(folder), readonly=True)
+                if st != "OK":
+                    return {"success": False, "error": f"Folder not found: {folder}"}
+                st, msg_data = _imap_uid_fetch(conn, uid, "(UID RFC822.HEADER)")
+            if st != "OK" or not msg_data:
+                return {"success": False, "error": "Email not found"}
+            raw_header = b""
+            for item in msg_data or []:
+                if isinstance(item, tuple) and len(item) >= 2:
+                    raw_header = item[1] or b""
+                    break
+            msg = email_mod.message_from_bytes(raw_header)
+            candidate = _email_unsubscribe_candidate_from_msg(msg, uid, folder)
+            if not candidate:
+                return {"success": False, "error": "No unsubscribe header found for this email"}
+            methods = [m for m in (candidate.get("methods") or []) if m.get("kind") == "mailto" and m.get("executable")]
+            if not methods:
+                return {"success": False, "error": "This email only has web unsubscribe links; open manually for now", "candidate": candidate}
+            method = methods[method_index] if 0 <= method_index < len(methods) else methods[0]
+            target = str(method.get("target") or "").strip()
+            if not target or "\r" in target or "\n" in target:
+                return {"success": False, "error": "Invalid unsubscribe address"}
+            cfg = _resolve_send_config(account_id, owner=owner)
+            subject = str(method.get("subject") or "unsubscribe")[:200]
+            body = str(method.get("body") or "unsubscribe")[:1000]
+            msg_out = MIMEText(body or "unsubscribe", "plain", "utf-8")
+            msg_out["From"] = email.utils.formataddr((cfg.get("display_name") or "", cfg["from_address"]))
+            msg_out["To"] = target
+            msg_out["Subject"] = subject
+            msg_out["Message-ID"] = email.utils.make_msgid(domain="odysseus.local")
+            _apply_odysseus_headers(msg_out, "unsubscribe", uid)
+            _send_smtp_message(cfg, cfg["from_address"], [target], msg_out.as_string())
+            moved = False
+            if move_to_spam:
+                try:
+                    with _imap(account_id, owner=owner) as conn:
+                        conn.select(_q(folder))
+                        moved = _move_email_message(conn, uid, "Junk", role="junk")
+                    if moved:
+                        _email_index_delete(owner, account_id, folder, uid)
+                        _invalidate_list_cache(account_id)
+                except Exception:
+                    logger.debug("unsubscribe move-to-spam skipped", exc_info=True)
+            return {
+                "success": True,
+                "method": method,
+                "candidate": candidate,
+                "moved_to_spam": moved,
+            }
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"unsubscribe execute failed uid={uid}: {e}")
+            return {"success": False, "error": "Mail operation failed"}
+
+    @router.post("/unsubscribe/cleanup")
+    def cleanup_unsubscribe_candidates(data: dict, owner: str = Depends(require_owner)):
+        """Move reviewed unsubscribe candidate messages to Junk or Trash."""
+        folder = str((data or {}).get("folder") or "INBOX").strip() or "INBOX"
+        account_id = (data or {}).get("account_id") or None
+        action = str((data or {}).get("action") or "").strip().lower()
+        raw_uids = (data or {}).get("uids") or []
+        if action not in {"junk", "delete"}:
+            raise HTTPException(400, "Unsupported cleanup action")
+        if account_id:
+            _assert_owns_account(account_id, owner)
+        uids: list[str] = []
+        seen = set()
+        for raw_uid in raw_uids:
+            uid = str(raw_uid or "").strip()
+            if not uid or uid in seen:
+                continue
+            if not uid.isdigit():
+                continue
+            seen.add(uid)
+            uids.append(uid)
+        if not uids:
+            return {"success": False, "error": "No email UIDs provided", "changed": 0, "failed": 0}
+        role = "junk" if action == "junk" else "trash"
+        target = "Junk" if action == "junk" else "Trash"
+        changed = 0
+        failed = 0
+        try:
+            with _imap(account_id, owner=owner) as conn:
+                conn.select(_q(folder))
+                for uid in uids:
+                    try:
+                        if _move_email_message(conn, uid, target, role=role):
+                            changed += 1
+                            _email_index_delete(owner, account_id, folder, uid)
+                        else:
+                            failed += 1
+                    except Exception:
+                        failed += 1
+                        logger.debug("unsubscribe cleanup failed for uid=%s", uid, exc_info=True)
+            if changed:
+                _invalidate_list_cache(account_id)
+            return {"success": True, "action": action, "changed": changed, "failed": failed}
+        except Exception as e:
+            logger.error(f"unsubscribe cleanup failed: {e}")
+            return {"success": False, "error": "Mail operation failed", "changed": changed, "failed": failed}
 
     @router.get("/contacts")
     async def list_contacts(
@@ -1281,13 +1566,22 @@ def setup_email_routes():
                 return indexed_response
             return {"emails": [], "total": 0, "error": "Mail operation failed"}
 
-    def _read_email_sync(uid, folder, account_id, owner, mark_seen=True, full=False):
+    def _read_email_sync(uid, folder, account_id, owner, mark_seen=False, full=False):
         """Sync IMAP read — wrapped in to_thread by the async handler.
 
         The normal reader path fetches the headers plus a bounded body prefix.
         That avoids downloading multi-megabyte attachments just to open a
         message. Full-message fetch remains available for flows that need
         attachment metadata immediately, such as forwarding.
+
+        `mark_seen` defaults to False because it mutates provider state: it
+        selects the mailbox read-write and issues a STORE. Only a foreground
+        open should ask for it, and it has to ask explicitly.
+
+        A failed \\Seen transition is reported as `mark_seen_failed` on an
+        otherwise normal response, never as an error. The body has already been
+        fetched at that point, so refusing to return it would turn a cosmetic
+        flag failure into an unreadable message.
         """
         import time as _t
         _t0 = _t.monotonic()
@@ -1295,9 +1589,28 @@ def setup_email_routes():
         preview_bytes = 384 * 1024
         _t_select = 0.0
         _t_fetch = 0.0
+        mark_seen_failed = False
         try:
             with _imap(account_id, owner=owner) as conn:
-                conn.select(_q(folder), readonly=True)
+                # A foreground open owns both the body fetch and the \Seen
+                # transition. Keep them on one read-write IMAP selection so the
+                # route never schedules a second connection that can race the
+                # response. Prefetch/read-only callers retain BODY.PEEK and a
+                # read-only mailbox selection.
+                try:
+                    conn.select(_q(folder), readonly=not mark_seen)
+                except Exception as select_exc:
+                    if not mark_seen:
+                        raise
+                    # Read-only mailboxes (shared archives, some provider
+                    # folders) reject a read-write SELECT. Serve the message
+                    # read-only and report the flag failure.
+                    logger.warning(
+                        f"read-write SELECT rejected for {folder!r}; "
+                        f"serving read-only without \\Seen: {select_exc}"
+                    )
+                    conn.select(_q(folder), readonly=True)
+                    mark_seen_failed = True
                 _t_select = _t.monotonic() - _t0
                 fetch_query = "(BODY.PEEK[])" if full else f"(BODY.PEEK[HEADER] BODY.PEEK[TEXT]<0.{preview_bytes}>)"
                 status, msg_data = _imap_uid_fetch(conn, uid, fetch_query)
@@ -1323,22 +1636,44 @@ def setup_email_routes():
                         header_part = msg_data[0][1] or b""
                     raw = header_part + b"\r\n" + text_part
 
-            msg = email_mod.message_from_bytes(raw)
+                # Parse the fetched payload before mutating provider state. If
+                # the message is malformed enough that the reader cannot build
+                # a response, the caller gets an error while the message stays
+                # unread instead of receiving a false optimistic rollback.
+                msg = email_mod.message_from_bytes(raw)
 
-            subject = _decode_header(msg.get("Subject", "(no subject)"))
-            sender = _decode_header(msg.get("From", "unknown"))
-            to = _decode_header(msg.get("To", ""))
-            cc = _decode_header(msg.get("Cc", ""))
-            date_str = msg.get("Date", "")
-            message_id = msg.get("Message-ID", "")
-            in_reply_to = msg.get("In-Reply-To", "")
-            references = msg.get("References", "")
-            body = _extract_text(msg)
-            body_html = _extract_html(msg)
+                subject = _decode_header(msg.get("Subject", "(no subject)"))
+                sender = _decode_header(msg.get("From", "unknown"))
+                to = _decode_header(msg.get("To", ""))
+                cc = _decode_header(msg.get("Cc", ""))
+                date_str = msg.get("Date", "")
+                message_id = msg.get("Message-ID", "")
+                in_reply_to = msg.get("In-Reply-To", "")
+                references = msg.get("References", "")
+                body = _extract_text(msg)
+                body_html = _extract_html(msg)
 
-            sender_name, sender_addr = email.utils.parseaddr(sender)
-            parsed_date = email.utils.parsedate_to_datetime(date_str) if date_str else None
-            attachments = _list_attachments_from_msg(msg) if full else (_email_attachment_meta_cache_get(owner, account_id, folder, uid) or [])
+                sender_name, sender_addr = email.utils.parseaddr(sender)
+                parsed_date = email.utils.parsedate_to_datetime(date_str) if date_str else None
+                attachments = _list_attachments_from_msg(msg) if full else (_email_attachment_meta_cache_get(owner, account_id, folder, uid) or [])
+
+                if mark_seen and not mark_seen_failed:
+                    seen_status, _ = conn.uid("STORE", _uid_bytes(uid), "+FLAGS", "(\\Seen)")
+                    if seen_status != "OK":
+                        # Report, don't raise. The parsed body below is still a
+                        # valid response; only the flag claim is untrue.
+                        logger.warning(
+                            f"IMAP STORE \\Seen failed for UID {uid} in {folder!r}: {seen_status}"
+                        )
+                        mark_seen_failed = True
+
+            # Only record the local flag transition when the provider actually
+            # accepted it, so the index and list cache cannot drift ahead of
+            # the mailbox.
+            if mark_seen and not mark_seen_failed:
+                _email_index_update_flags(owner, account_id, folder, uid, "\\Seen", True)
+                _update_list_cache_seen(account_id, folder, uid, True)
+
             related_attachments = []
             if full and not _has_visible_attachments(msg):
                 related_attachments = _related_thread_attachments_sync(
@@ -1459,20 +1794,29 @@ def setup_email_routes():
                 "boundaries": cached_boundaries,
                 "thread_turns": cached_turns,
                 "sender_signature": cached_sender_sig,
+                # Per-request, not part of the message: the route strips this
+                # before caching so a one-off flag failure is never replayed to
+                # later readers.
+                "mark_seen_failed": mark_seen_failed,
             }
         except Exception as e:
             logger.error(f"Failed to read email {uid}: {e}")
             return {"error": "Mail operation failed"}
 
     def _mark_email_seen_sync(uid, folder, account_id, owner):
+        """Synchronously mark a cached email seen and report success."""
         try:
             with _imap(account_id, owner=owner) as conn:
-                conn.select(_q(folder))
-                conn.uid("STORE", _uid_bytes(uid), "+FLAGS", "\\Seen")
+                conn.select(_q(folder), readonly=False)
+                status, _ = conn.uid("STORE", _uid_bytes(uid), "+FLAGS", "(\\Seen)")
+                if status != "OK":
+                    return False
             _email_index_update_flags(owner, account_id, folder, uid, "\\Seen", True)
             _update_list_cache_seen(account_id, folder, uid, True)
+            return True
         except Exception as e:
-            logger.debug(f"mark-seen after cached read failed uid={uid}: {e}")
+            logger.warning(f"mark-seen after cached read failed uid={uid}: {e}")
+            return False
 
     @router.get("/read/{uid}")
     async def read_email_by_uid(
@@ -1498,32 +1842,32 @@ def setup_email_routes():
             if cached.get("attachment_version") != EMAIL_READ_ATTACHMENT_VERSION:
                 cached = None
         if cached is not None:
-            if mark_seen:
-                try:
-                    _asyncio.create_task(_asyncio.to_thread(_mark_email_seen_sync, uid, folder, account_id, owner))
-                except RuntimeError:
-                    pass
+            # A cache hit already holds a complete, valid message. Await the
+            # STORE so the response reports the real flag state, but never let
+            # a failed STORE withhold a body we are holding in memory.
+            if mark_seen and not await _asyncio.to_thread(
+                _mark_email_seen_sync, uid, folder, account_id, owner
+            ):
+                return {**cached, "mark_seen_failed": True}
             return cached
         if not full:
             persisted = _email_preview_cache_get(owner, account_id, folder, uid)
             if persisted and persisted.get("attachment_version") == EMAIL_READ_ATTACHMENT_VERSION:
                 _read_cache_put(ck, persisted)
-                if mark_seen:
-                    try:
-                        _asyncio.create_task(_asyncio.to_thread(_mark_email_seen_sync, uid, folder, account_id, owner))
-                    except RuntimeError:
-                        pass
+                if mark_seen and not await _asyncio.to_thread(
+                    _mark_email_seen_sync, uid, folder, account_id, owner
+                ):
+                    return {**persisted, "mark_seen_failed": True}
                 return persisted
         result = await _asyncio.to_thread(_read_email_sync, uid, folder, account_id, owner, mark_seen, full)
         if result and not result.get("error"):
-            _read_cache_put(ck, result)
+            # `mark_seen_failed` describes this request, not the message, so it
+            # must not enter either cache — a later reader would otherwise be
+            # told a STORE failed that it never issued.
+            cacheable = {k: v for k, v in result.items() if k != "mark_seen_failed"}
+            _read_cache_put(ck, cacheable)
             if not full:
-                _email_preview_cache_put(owner, account_id, folder, uid, result)
-            if mark_seen:
-                try:
-                    _asyncio.create_task(_asyncio.to_thread(_mark_email_seen_sync, uid, folder, account_id, owner))
-                except RuntimeError:
-                    pass
+                _email_preview_cache_put(owner, account_id, folder, uid, cacheable)
         return result
 
     def _schedule_recent_email_warm(emails: list, folder: str, account_id: str | None, owner: str):
@@ -1558,7 +1902,7 @@ def setup_email_routes():
             return
 
         async def _warm():
-            await _asyncio.sleep(3.0)
+            await _asyncio.sleep(0.25)
             for uid, ck in selected:
                 if _read_cache_get(ck) is not None:
                     _WARMING_READS.discard(ck)
@@ -1731,7 +2075,7 @@ def setup_email_routes():
             return {"error": "Mail operation failed"}
 
     @router.post("/attachment-as-doc/{uid}/{index}")
-    async def attachment_as_doc(uid: str, index: int, request: Request, folder: str = Query("INBOX"), account_id: str | None = Query(None), owner: str = Depends(require_owner)):
+    def attachment_as_doc(uid: str, index: int, request: Request, folder: str = Query("INBOX"), account_id: str | None = Query(None), owner: str = Depends(require_owner)):
         """Extract an email attachment and open it in the document editor.
 
         Supported extensions:
@@ -2217,7 +2561,11 @@ def setup_email_routes():
             return {"success": False, "error": "Mail operation failed"}
 
     @router.get("/folders")
-    async def list_folders(account_id: str | None = Query(None), owner: str = Depends(require_owner)):
+    async def list_folders(
+        account_id: str | None = Query(None),
+        cached_only: int = Query(0),
+        owner: str = Depends(require_owner),
+    ):
         """List IMAP folders."""
         if _fixture_email_enabled():
             return {"folders": ["INBOX", "Archive", "Sent"], "sync": {"source": "fixture"}}
@@ -2228,19 +2576,57 @@ def setup_email_routes():
             sync_meta["source"] = "folder_cache"
             payload["sync"] = sync_meta
             return payload
-        try:
+        if cached_only:
+            stale = _folder_cache_get_stale(account_id, owner)
+            if stale:
+                payload = dict(stale)
+                sync_meta = dict(payload.get("sync") or {})
+                sync_meta["source"] = "folder_cache_stale"
+                payload["sync"] = sync_meta
+                return payload
+            return {
+                "folders": ["INBOX", "Sent", "Archive"],
+                "sync": {"source": "folder_cached_only_fallback"},
+            }
+
+        def _list_folders_sync():
             with _imap(account_id, owner=owner) as conn:
                 status, folders = conn.list()
             result = []
-            for f in folders:
+            for f in folders or []:
                 decoded = f.decode() if isinstance(f, bytes) else f
                 match = re.search(r'"([^"]*)"$|(\S+)$', decoded)
                 if match:
                     name = match.group(1) or match.group(2)
                     result.append(name)
-            payload = {"folders": result, "sync": {"source": "imap", "updated_at": datetime.utcnow().isoformat() + "Z"}}
+            return {
+                "folders": result,
+                "sync": {
+                    "source": "imap",
+                    "updated_at": datetime.utcnow().isoformat() + "Z",
+                    "status": status.decode() if isinstance(status, bytes) else status,
+                },
+            }
+
+        try:
+            payload = await _asyncio.wait_for(_asyncio.to_thread(_list_folders_sync), timeout=8.0)
             _folder_cache_put(account_id, owner, payload)
             return payload
+        except _asyncio.TimeoutError:
+            logger.warning(f"list_folders timed out for account={account_id or 'default'} owner={owner}")
+            stale = _folder_cache_get_stale(account_id, owner)
+            if stale:
+                payload = dict(stale)
+                sync_meta = dict(payload.get("sync") or {})
+                sync_meta["source"] = "folder_cache_stale"
+                sync_meta["warning"] = "Folder list timed out"
+                payload["sync"] = sync_meta
+                return payload
+            return {
+                "folders": ["INBOX", "Sent", "Archive"],
+                "error": "Folder list timed out",
+                "sync": {"source": "folder_timeout_fallback"},
+            }
         except Exception as e:
             logger.error(f"list_folders failed: {e}")
             return {"folders": [], "error": "Mail operation failed"}
@@ -3032,17 +3418,23 @@ def setup_email_routes():
         return {"success": True, "message": "Draft saved"}
 
     @router.post("/extract-style")
-    async def extract_writing_style(req: ExtractStyleRequest, owner: str = Depends(require_owner)):
+    async def extract_writing_style(
+        req: ExtractStyleRequest,
+        account_id: str | None = Query(None),
+        owner: str = Depends(require_owner),
+    ):
         """Extract writing style from sent emails using LLM.
 
         IMAP fetch is offloaded to a worker thread; the LLM call uses the
         async client. Otherwise this handler froze the event loop for ~5s
         on the IMAP step alone with a remote server.
         """
+        if account_id:
+            _assert_owns_account(account_id, owner)
 
         def _gather_samples() -> tuple[list[str], str | None]:
             try:
-                with _imap(owner=owner) as imap:
+                with _imap(account_id, owner=owner) as imap:
                     imap.select(_q(_detect_sent_folder(imap)), readonly=True)
                     status, data = imap.search(None, "ALL")
                     if status != "OK" or not data[0]:
@@ -3124,7 +3516,7 @@ def setup_email_routes():
 
             # Save to settings
             settings = _load_settings()
-            settings["email_writing_style"] = style
+            _set_email_writing_style_for_account(settings, style, account_id)
             _save_settings(settings)
 
             logger.info("Writing style extracted and saved")
@@ -3139,8 +3531,6 @@ def setup_email_routes():
         """Generate a quick AI summary of an email body."""
         try:
             from src.endpoint_resolver import resolve_endpoint
-            from src.llm_core import _uses_max_completion_tokens, _restricts_temperature
-            import requests as _req
 
             body = data.get("body", "")
             subject = data.get("subject", "")
@@ -3151,7 +3541,11 @@ def setup_email_routes():
             if account_id:
                 _assert_owns_account(account_id, owner)
             if not body:
-                return {"success": False, "error": "No body provided"}
+                return {
+                    "success": False,
+                    "error": "No body provided",
+                    "error_code": "email_summary_missing_body",
+                }
 
             # If we know which UID this is, fetch the raw message and pull
             # attachment text so the summary can reference invoice totals,
@@ -3180,53 +3574,43 @@ def setup_email_routes():
             if not url:
                 url, model, headers = resolve_endpoint("default", owner=owner)
             if not url or not model:
-                return {"success": False, "error": "No LLM endpoint configured"}
+                return {
+                    "success": False,
+                    "error": "No model configured for email summaries",
+                    "error_code": "email_summary_not_configured",
+                }
 
             req_headers = {"Content-Type": "application/json"}
             if headers:
                 req_headers.update(headers)
-            tok_key = "max_completion_tokens" if _uses_max_completion_tokens(model) else "max_tokens"
-            payload = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": "You are an email summarizer. Format: 1-3 short bullet points (use '- '). Cover: main point, action items, deadlines. If the email has attachments (marked '--- ATTACHMENTS ---'), USE THEIR CONTENTS — pull invoice totals, deadlines, key clauses, concrete numbers/dates from PDFs/docs into the bullets. Be terse.\n\nOUTPUT FORMAT: Put ONLY the bullet points between these exact markers, each on its own line:\n<<<SUMMARY>>>\n- ...\n<<<END>>>\nAny reasoning must come BEFORE <<<SUMMARY>>> (ideally inside <think>...</think>). Only the text between the markers is kept."},
-                    {"role": "user", "content": f"From: {sender}\nSubject: {subject}\n\n{body_for_llm[:12000]}\n\n---\n\nSummarize the email. Output the bullets between <<<SUMMARY>>> and <<<END>>>."},
-                ],
-                tok_key: 8192,
-                "temperature": 0.3,
-                "stream": False,
-            }
-            # Reasoning models (o1/o3/o4/gpt-5) reject an explicit temperature.
-            if _restricts_temperature(model):
-                payload.pop("temperature", None)
-            resp = await asyncio.to_thread(
-                _req.post, url, json=payload, headers=req_headers, timeout=180
-            )
-            if not resp.ok:
-                return {"success": False, "error": f"LLM HTTP {resp.status_code}"}
-            rdata = resp.json()
-            msg = (rdata.get("choices") or [{}])[0].get("message", {})
-            content = (msg.get("content") or "").strip()
-            content = _extract_reply(content)
+            try:
+                content = await _generate_email_summary(
+                    url=url,
+                    model=model,
+                    sender=sender,
+                    subject=subject,
+                    body_for_llm=body_for_llm,
+                    headers=req_headers,
+                    max_tokens=8192,
+                    timeout=180,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Email summary LLM call failed %s",
+                    _email_summary_failure_log_detail(e),
+                )
+                return {
+                    "success": False,
+                    "error": EMAIL_SUMMARY_ERROR_MESSAGE,
+                    "error_code": EMAIL_SUMMARY_ERROR_CODE,
+                }
 
             if not content:
-                # Model put everything in reasoning_content — extract bullet points
-                rc = (msg.get("reasoning_content") or "").strip()
-                # Find bullet-point style output (lines starting with -, •, *, or numbered)
-                bullet_lines = []
-                for line in rc.split("\n"):
-                    stripped = line.strip()
-                    if re.match(r"^[-•*]\s+|^\d+[.)]\s+", stripped):
-                        bullet_lines.append(stripped)
-                if bullet_lines:
-                    content = "\n".join(bullet_lines)
-                else:
-                    # Last resort: take the last paragraph
-                    paragraphs = [p.strip() for p in rc.split("\n\n") if p.strip()]
-                    content = paragraphs[-1] if paragraphs else rc[:500]
-
-            if not content:
-                return {"success": False, "error": "Empty response from model"}
+                return {
+                    "success": False,
+                    "error": "The model returned an empty summary",
+                    "error_code": "email_summary_empty",
+                }
 
             # Cache the summary if we have a message_id
             mid = data.get("message_id", "")
@@ -3249,8 +3633,15 @@ def setup_email_routes():
 
             return {"success": True, "summary": content, "model_used": model}
         except Exception as e:
-            logger.error(f"Failed to summarize: {e}")
-            return {"success": False, "error": "Mail operation failed"}
+            logger.error(
+                "Email summary route failed %s",
+                _email_summary_failure_log_detail(e),
+            )
+            return {
+                "success": False,
+                "error": EMAIL_SUMMARY_ERROR_MESSAGE,
+                "error_code": EMAIL_SUMMARY_ERROR_CODE,
+            }
 
     @router.post("/translate")
     async def translate_email(data: dict, owner: str = Depends(require_owner)):
@@ -3259,7 +3650,6 @@ def setup_email_routes():
             from src.endpoint_resolver import (
                 resolve_endpoint,
                 resolve_utility_fallback_candidates,
-                resolve_chat_fallback_candidates,
             )
             from src.llm_core import llm_call_async_with_fallback
 
@@ -3320,8 +3710,6 @@ def setup_email_routes():
             except Exception:
                 pass
             for cand in resolve_utility_fallback_candidates(owner=owner) or []:
-                _add(*cand)
-            for cand in resolve_chat_fallback_candidates(owner=owner) or []:
                 _add(*cand)
             if not candidates:
                 return {"success": False, "error": "No LLM endpoint configured"}
@@ -3416,8 +3804,11 @@ def setup_email_routes():
             message_id = (data.get("message_id") or "").strip()
             source_uid = (data.get("uid") or "").strip()
             source_folder = (data.get("folder") or "INBOX").strip()
+            account_id = (data.get("account_id") or "").strip() or None
             fast_reply = bool(data.get("fast", False))
             user_hint = (data.get("user_hint") or "").strip()
+            if account_id:
+                _assert_owns_account(account_id, owner)
 
             if not original_body:
                 return {"success": False, "error": "No email body provided"}
@@ -3425,7 +3816,7 @@ def setup_email_routes():
             # Skip cache lookup when the caller supplied a user_hint — the
             # cached generic reply doesn't reflect the instructions and
             # would silently override them.
-            if message_id and not user_hint:
+            if message_id and not user_hint and not account_id:
                 try:
                     _c = _sql3.connect(SCHEDULED_DB)
                     owner_clause, owner_params = _email_cache_owner_clause(owner)
@@ -3447,7 +3838,7 @@ def setup_email_routes():
                     logger.warning(f"AI reply cache lookup failed: {e}")
 
             settings = _load_settings()
-            style = settings.get("email_writing_style", "")
+            style = _get_email_writing_style_for_account(settings, account_id)
 
             # Try session's endpoint first if session_id provided
             url = None
@@ -3568,21 +3959,22 @@ def setup_email_routes():
             )
             if user_hint:
                 user_msg += (
-                    f"User's instructions for THIS reply (follow these — they override "
-                    f"defaults like length/tone):\n{user_hint[:2000]}\n\n"
+                    "User guidance for THIS reply. Treat this as intent/context to fold "
+                    "into a normal polished email reply in the user's writing style. "
+                    "Do not answer with only this guidance unless the user explicitly "
+                    "asked for a one-word reply:\n"
+                    f"{user_hint[:2000]}\n\n"
                 )
             user_msg += "Draft a reply. Return only the reply body text."
 
             # Build a candidate chain so a stale session-stored API key
             # (the most common cause of "authentication failed" here)
             # doesn't kill AI Reply outright — fall through to the
-            # user's Utility / Default endpoints AND their configured
-            # fallback chains. Dedupe by url+model so we don't retry
-            # the same broken endpoint.
+            # user's Utility / Default endpoints and active Utility fallback
+            # chain. Dedupe by url+model so we don't retry the same endpoint.
             from src.llm_core import llm_call_async_with_fallback
             from src.endpoint_resolver import (
                 resolve_utility_fallback_candidates,
-                resolve_chat_fallback_candidates,
             )
             _seen = set()
             _candidates = []
@@ -3607,10 +3999,8 @@ def setup_email_routes():
                 _add(_d_url, _d_model, _d_headers)
             except Exception:
                 pass
-            # Configured fallback chains last.
+            # Active Utility fallbacks last.
             for cand in resolve_utility_fallback_candidates(owner=owner) or []:
-                _add(*cand)
-            for cand in resolve_chat_fallback_candidates(owner=owner) or []:
                 _add(*cand)
             _messages = [
                 {"role": "system", "content": system_prompt},
@@ -3695,32 +4085,67 @@ def setup_email_routes():
             return {"success": False, "error": "Mail operation failed"}
 
     @router.get("/style")
-    async def get_writing_style(owner: str = Depends(require_user)):
+    async def get_writing_style(
+        account_id: str | None = Query(None),
+        owner: str = Depends(require_user),
+    ):
         """Get the current writing style prompt."""
+        if account_id:
+            _assert_owns_account(account_id, owner)
         settings = _load_settings()
-        return {"style": settings.get("email_writing_style", "")}
+        return {"style": _get_email_writing_style_for_account(settings, account_id)}
 
     @router.put("/style")
-    async def update_writing_style(data: dict, owner: str = Depends(require_user)):
+    async def update_writing_style(
+        data: dict,
+        account_id: str | None = Query(None),
+        owner: str = Depends(require_user),
+    ):
         """Manually update the writing style prompt."""
+        if account_id:
+            _assert_owns_account(account_id, owner)
         settings = _load_settings()
-        settings["email_writing_style"] = data.get("style", "")
+        _set_email_writing_style_for_account(settings, data.get("style", ""), account_id)
         _save_settings(settings)
         return {"success": True}
 
     @router.get("/config")
-    async def get_email_config(owner: str = Depends(require_user)):
+    async def get_email_config(
+        account_id: str | None = Query(None),
+        owner: str = Depends(require_user),
+    ):
         """Get email configuration (passwords masked)."""
-        cfg = _get_email_config(owner=owner)
+        if account_id is not None and not isinstance(account_id, str):
+            account_id = None
+        if account_id:
+            _assert_owns_account(account_id, owner)
+        cfg = _get_email_config(account_id, owner=owner)
         cfg["smtp_password"] = "***" if cfg["smtp_password"] else ""
         cfg["imap_password"] = "***" if cfg["imap_password"] else ""
+        # `_get_email_config` includes encrypted OAuth fields for the server's
+        # IMAP/SMTP helpers.  They are implementation secrets, not client
+        # configuration, so keep them out of this browser-facing response just
+        # as the account-list endpoint does.
+        cfg.pop("oauth_access_token", None)
+        cfg.pop("oauth_refresh_token", None)
+        cfg.pop("oauth_token_expiry", None)
         # Include preferences from settings.json
         settings = _load_settings()
+        auto_reply_settings = _get_auto_reply_settings_for_account(settings, account_id)
         cfg["email_auto_summarize"] = bool(settings.get("email_auto_summarize", False))
-        cfg["email_auto_reply"] = bool(settings.get("email_auto_reply", False))
+        cfg["email_auto_reply"] = bool(auto_reply_settings.get("email_auto_reply", False))
         cfg["email_auto_tag"] = bool(settings.get("email_auto_tag", False))
         cfg["email_auto_spam"] = bool(settings.get("email_auto_spam", False))
         cfg["email_auto_calendar"] = bool(settings.get("email_auto_calendar", False))
+        cfg["email_auto_reply_start"] = auto_reply_settings.get("email_auto_reply_start", "")
+        cfg["email_auto_reply_end"] = auto_reply_settings.get("email_auto_reply_end", "")
+        cfg["email_auto_reply_subject"] = auto_reply_settings.get("email_auto_reply_subject", "(Away) {subject}")
+        cfg["email_auto_reply_message"] = auto_reply_settings.get("email_auto_reply_message", "")
+        cfg["email_auto_reply_cooldown"] = auto_reply_settings.get("email_auto_reply_cooldown", "period")
+        cfg["email_auto_reply_scope"] = auto_reply_settings.get("email_auto_reply_scope", "account" if account_id else "all")
+        cfg["email_auto_reply_account_id"] = auto_reply_settings.get("email_auto_reply_account_id", account_id or "")
+        cfg["email_auto_reply_exclude_automated"] = bool(auto_reply_settings.get("email_auto_reply_exclude_automated", True))
+        cfg["email_auto_reply_pause_notifications"] = bool(auto_reply_settings.get("email_auto_reply_pause_notifications", False))
         # Email translation is owned by the background task now; opening an email
         # should not trigger reader-side auto-translation from Settings.
         cfg["email_auto_translate"] = False
@@ -3728,7 +4153,11 @@ def setup_email_routes():
         return cfg
 
     @router.put("/config")
-    async def update_email_config(data: dict, owner: str = Depends(require_owner)):
+    async def update_email_config(
+        data: dict,
+        account_id: str | None = Query(None),
+        owner: str = Depends(require_owner),
+    ):
         """Update email configuration.
 
         Automation flags (email_auto_*) still live in settings.json. Credentials
@@ -3736,11 +4165,19 @@ def setup_email_routes():
         overwritten when a non-empty value is provided, so saving the form
         without retyping the password no longer wipes it.
         """
-        # Automation flags stay in settings.json (they're global, not per-account)
+        if account_id:
+            _assert_owns_account(account_id, owner)
+
+        # Non-reply automation flags stay global. Away/auto-reply settings are
+        # account-scoped when an account_id is supplied by the Email Settings UI.
         settings = _load_settings()
-        for key in ["email_auto_summarize", "email_auto_reply", "email_auto_tag", "email_auto_spam", "email_auto_calendar"]:
+        bool_keys = [
+            "email_auto_summarize", "email_auto_tag", "email_auto_spam", "email_auto_calendar",
+        ]
+        for key in bool_keys:
             if key in data:
-                settings[key] = data[key]
+                settings[key] = bool(data[key])
+        _set_auto_reply_settings_for_account(settings, data, account_id)
         _save_settings(settings)
 
         # Credentials go into the default account row
@@ -3748,9 +4185,9 @@ def setup_email_routes():
         import uuid as _uuid
         db = SessionLocal()
         try:
+            _lock_email_account_owner_mutation(db, owner)
             q = db.query(EmailAccount).filter(EmailAccount.is_default == True)  # noqa: E712
-            if owner:
-                q = q.filter(EmailAccount.owner == owner)
+            q = _email_account_owner_scope(q, owner)
             row = q.first()
             if row is None:
                 row = EmailAccount(id=_uuid.uuid4().hex, owner=owner, name="Default", is_default=True, enabled=True)
@@ -3776,8 +4213,7 @@ def setup_email_routes():
             if data.get("smtp_password"):
                 row.smtp_password = _enc(data["smtp_password"])
             clear_q = db.query(EmailAccount).filter(EmailAccount.id != row.id)
-            if owner:
-                clear_q = clear_q.filter(EmailAccount.owner == owner)
+            clear_q = _email_account_owner_scope(clear_q, owner)
             clear_q.update({EmailAccount.is_default: False})
             db.commit()
         finally:
@@ -3872,6 +4308,7 @@ def setup_email_routes():
             return {"ok": False, "error": port_err}
         db = SessionLocal()
         try:
+            _lock_email_account_owner_mutation(db, owner)
             row = EmailAccount(
                 id=_uuid.uuid4().hex,
                 name=name,
@@ -3902,9 +4339,7 @@ def setup_email_routes():
             # the one-default invariant — but scope it to THIS user's accounts,
             # otherwise creating a default would clear every other user's
             # default flag too.
-            scope_q = db.query(EmailAccount)
-            if owner:
-                scope_q = scope_q.filter(EmailAccount.owner == owner)
+            scope_q = _email_account_owner_scope(db.query(EmailAccount), owner)
             existing_count = scope_q.count()
             if row.is_default or existing_count == 0:
                 scope_q.update({EmailAccount.is_default: False})
@@ -3960,28 +4395,39 @@ def setup_email_routes():
 
     @router.delete("/accounts/{account_id}")
     async def delete_email_account(account_id: str, owner: str = Depends(require_user)):
-        _assert_owns_account(account_id, owner)
+        initial_scope = _discover_email_account_mutation_scope(account_id, owner)
         from core.database import SessionLocal, EmailAccount
         db = SessionLocal()
         try:
-            row = db.get(EmailAccount, account_id)
-            if not row:
-                return {"ok": False, "error": "Account not found"}
+            row = _lock_and_reload_email_account(
+                db, account_id, owner, initial_scope
+            )
+            row_scope = row.owner or ""
             was_default = bool(row.is_default)
             db.delete(row)
-            db.commit()
+            # Flush the removal before staging a replacement default.  The
+            # partial unique index is checked statement-by-statement, and the
+            # ORM is otherwise free to UPDATE the promoted row before DELETE.
+            db.flush()
             # If the deleted row was default, promote the next-oldest enabled
             # row owned by THIS user. Without the owner filter we'd promote
             # another user's account and the deleter would silently inherit
             # it as their default.
             if was_default:
-                promote_q = db.query(EmailAccount).filter(EmailAccount.enabled == True)  # noqa: E712
-                if owner:
-                    promote_q = promote_q.filter(EmailAccount.owner == owner)
-                promote = promote_q.order_by(EmailAccount.created_at.asc()).first()
+                promote_q = db.query(EmailAccount).filter(
+                    EmailAccount.id != account_id,
+                    EmailAccount.enabled == True,  # noqa: E712
+                )
+                promote_q = _email_account_owner_scope(promote_q, row_scope)
+                promote = promote_q.order_by(
+                    EmailAccount.created_at.asc(), EmailAccount.id.asc()
+                ).first()
                 if promote:
                     promote.is_default = True
-                    db.commit()
+            # Deletion and any replacement promotion are one durable state
+            # transition, so another worker can never observe or race the old
+            # split-commit gap.
+            db.commit()
             return {"ok": True}
         finally:
             db.close()
@@ -4030,15 +4476,24 @@ def setup_email_routes():
                     "smtp_security": _smtp_security_mode({"smtp_security": getattr(row, "smtp_security", ""), "smtp_port": row.smtp_port}),
                     "smtp_user": row.smtp_user or "",
                     "smtp_password": _decrypt(row.smtp_password or ""),
+                    "oauth_provider": row.oauth_provider or "",
+                    "oauth_access_token": row.oauth_access_token or "",
+                    "oauth_refresh_token": row.oauth_refresh_token or "",
+                    "oauth_token_expiry": row.oauth_token_expiry or "",
+                    "account_id": acc_id,
                 }
                 for key, value in body.items():
-                    if key == "account_id":
+                    if key == "account_id" or key in _SERVER_OWNED_OAUTH_FIELDS:
                         continue
                     if value not in (None, ""):
                         saved_body[key] = value
                 body = saved_body
             finally:
                 db.close()
+        else:
+            # OAuth state belongs to a saved, owner-checked account. Do not let
+            # inline test payloads select the OAuth branch or supply token data.
+            body = {key: value for key, value in body.items() if key not in _SERVER_OWNED_OAUTH_FIELDS}
 
         imap_result = {"ok": False}
         smtp_result = None
@@ -4048,11 +4503,33 @@ def setup_email_routes():
         imap_user = (body.get("imap_user") or "").strip()
         imap_pass = body.get("imap_password") or ""
         imap_starttls = _normalize_imap_starttls(imap_host, imap_port or 993, body.get("imap_starttls"))
+        oauth_provider = body.get("oauth_provider") or ""
+
+        google_token = None
+        google_token_loaded = False
+        google_ssl_context = (
+            ssl.create_default_context()
+            if oauth_provider == "google"
+            else None
+        )
+
+        def _google_token():
+            nonlocal google_token, google_token_loaded
+            if not google_token_loaded:
+                google_token = _get_valid_google_token(body.get("account_id"), body)
+                google_token_loaded = True
+            if not google_token:
+                raise RuntimeError("Google OAuth token unavailable — reconnect the account")
+            return google_token
 
         if imap_port_err:
             imap_result = {"ok": False, "error": imap_port_err}
-        elif not (imap_host and imap_user and imap_pass):
+        elif not (imap_host and imap_user and (imap_pass or oauth_provider == "google")):
             imap_result = {"ok": False, "error": "Need IMAP host, username, and password"}
+        elif oauth_provider == "google" and _normalized_mail_host(imap_host) != _GOOGLE_OAUTH_IMAP_HOST:
+            imap_result = {"ok": False, "error": "Google OAuth IMAP requires imap.gmail.com"}
+        elif oauth_provider == "google" and not _google_oauth_imap_transport_allowed(imap_port, imap_starttls):
+            imap_result = {"ok": False, "error": "Google OAuth IMAP requires TLS on port 993 or STARTTLS on port 143"}
         else:
             # Connection mode resolution:
             #   STARTTLS on  → plain IMAP4 + .starttls() (upgrade)
@@ -4062,14 +4539,23 @@ def setup_email_routes():
             # port (Dovecot on 31143, etc.) would always fail the SSL
             # handshake because they're not actually wrapped in TLS.
             try:
+                imap_kwargs = {
+                    "starttls": imap_starttls,
+                    "timeout": _IMAP_TIMEOUT_SECONDS,
+                }
+                if google_ssl_context:
+                    imap_kwargs["ssl_context"] = google_ssl_context
                 conn = _open_imap_connection(
                     imap_host,
                     imap_port,
-                    starttls=imap_starttls,
-                    timeout=_IMAP_TIMEOUT_SECONDS,
+                    **imap_kwargs,
                 )
                 try:
-                    conn.login(imap_user, imap_pass)
+                    if oauth_provider == "google":
+                        token = _google_token()
+                        conn.authenticate("XOAUTH2", lambda x: _xoauth2_bytes(imap_user, token))
+                    else:
+                        conn.login(imap_user, imap_pass)
                     imap_result = {"ok": True}
                 finally:
                     try: conn.logout()
@@ -4081,25 +4567,70 @@ def setup_email_routes():
         smtp_port, smtp_port_err = _coerce_port(body.get("smtp_port"), 465)
         if smtp_host and smtp_port_err:
             smtp_result = {"ok": False, "error": smtp_port_err}
+        elif oauth_provider == "google" and smtp_host and _normalized_mail_host(smtp_host) != _GOOGLE_OAUTH_SMTP_HOST:
+            smtp_result = {"ok": False, "error": "Google OAuth SMTP requires smtp.gmail.com"}
+        elif (
+            oauth_provider == "google"
+            and smtp_host
+            and not _google_oauth_smtp_transport_allowed(
+                smtp_port,
+                _smtp_security_mode({"smtp_security": body.get("smtp_security"), "smtp_port": smtp_port}),
+            )
+        ):
+            smtp_result = {"ok": False, "error": "Google OAuth SMTP requires TLS on port 465 or STARTTLS on port 587"}
         elif smtp_host:
             smtp_security = _smtp_security_mode({"smtp_security": body.get("smtp_security"), "smtp_port": smtp_port})
             smtp_user = (body.get("smtp_user") or imap_user).strip()
             smtp_pass = body.get("smtp_password") or imap_pass
+            smtp = None
             try:
                 if smtp_security == "ssl":
-                    smtp = smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=10)
+                    smtp_kwargs = (
+                        {"context": google_ssl_context}
+                        if google_ssl_context
+                        else {}
+                    )
+                    smtp = smtplib.SMTP_SSL(
+                        smtp_host,
+                        smtp_port,
+                        timeout=10,
+                        **smtp_kwargs,
+                    )
                 else:
                     smtp = smtplib.SMTP(smtp_host, smtp_port, timeout=10)
                     if smtp_security == "starttls":
-                        smtp.starttls()
-                try:
+                        try:
+                            if google_ssl_context:
+                                smtp.starttls(context=google_ssl_context)
+                            else:
+                                smtp.starttls()
+                        except Exception:
+                            # STARTTLS failed before the auth cleanup block.
+                            # Close the still-open plaintext socket explicitly.
+                            try:
+                                smtp.close()
+                            except Exception:
+                                pass
+                            smtp = None
+                            raise
+                if oauth_provider == "google":
+                    token = _google_token()
+                    smtp.ehlo()
+                    smtp.auth("XOAUTH2", lambda challenge=None: _xoauth2_raw(smtp_user, token), initial_response_ok=True)
+                else:
                     smtp.login(smtp_user, smtp_pass)
-                    smtp_result = {"ok": True}
-                finally:
-                    try: smtp.quit()
-                    except Exception: pass
+                smtp_result = {"ok": True}
             except Exception as e:
                 smtp_result = {"ok": False, "error": _friendly_email_auth_error("SMTP", smtp_host, e)}
+            finally:
+                if smtp is not None:
+                    try:
+                        smtp.quit()
+                    except Exception:
+                        try:
+                            smtp.close()
+                        except Exception:
+                            pass
 
         return {
             "ok": imap_result["ok"] and (smtp_result is None or smtp_result["ok"]),
@@ -4109,18 +4640,18 @@ def setup_email_routes():
 
     @router.post("/accounts/{account_id}/set-default")
     async def set_default_account(account_id: str, owner: str = Depends(require_user)):
-        _assert_owns_account(account_id, owner)
+        initial_scope = _discover_email_account_mutation_scope(account_id, owner)
         from core.database import SessionLocal, EmailAccount
         db = SessionLocal()
         try:
-            row = db.get(EmailAccount, account_id)
-            if not row:
-                return {"ok": False, "error": "Account not found"}
-            # SECURITY: scope the "clear other defaults" sweep to this user's
-            # accounts so we don't unset another user's default flag.
-            clear_q = db.query(EmailAccount)
-            if owner:
-                clear_q = clear_q.filter(EmailAccount.owner == owner)
+            row = _lock_and_reload_email_account(
+                db, account_id, owner, initial_scope
+            )
+            # Scope the sweep to the target row's normalized owner partition;
+            # this also handles visible legacy NULL/empty-owner accounts.
+            clear_q = _email_account_owner_scope(
+                db.query(EmailAccount), row.owner or ""
+            )
             clear_q.update({EmailAccount.is_default: False})
             row.is_default = True
             db.commit()
@@ -4139,7 +4670,7 @@ def setup_email_routes():
             raise HTTPException(400, "GOOGLE_OAUTH_CLIENT_ID not set — add it to .env")
         redirect_uri = (
             os.environ.get("GOOGLE_OAUTH_REDIRECT_URI")
-            or f"http://{request.headers.get('host', 'localhost:7000')}/api/email/oauth/google/callback"
+            or f"{request.url.scheme}://{request.headers.get('host', 'localhost:7000')}/api/email/oauth/google/callback"
         )
         state = make_oauth_state(account_id, owner)
         params = urllib.parse.urlencode({
@@ -4176,7 +4707,7 @@ def setup_email_routes():
         client_secret = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET", "")
         redirect_uri = (
             os.environ.get("GOOGLE_OAUTH_REDIRECT_URI")
-            or f"http://{request.headers.get('host', 'localhost:7000')}/api/email/oauth/google/callback"
+            or f"{request.url.scheme}://{request.headers.get('host', 'localhost:7000')}/api/email/oauth/google/callback"
         )
         import httpx as _httpx
         try:
@@ -4194,6 +4725,9 @@ def setup_email_routes():
             return _RR("/?section=integrations&email_oauth_error=token_exchange_failed")
         access_token = data.get("access_token", "")
         refresh_token = data.get("refresh_token", "")
+        if not access_token or not refresh_token:
+            logger.warning("Google token exchange omitted required offline credentials")
+            return _RR("/?section=integrations&email_oauth_error=token_exchange_failed")
         expiry = str(int(time.time()) + data.get("expires_in", 3600))
         # Fetch the email address from userinfo so we can auto-fill imap_user.
         email_addr = ""
@@ -4218,10 +4752,33 @@ def setup_email_routes():
             if owner and row.owner and row.owner != owner:
                 logger.warning("OAuth callback owner mismatch — rejecting token write")
                 return _RR("/?section=integrations&email_oauth_error=ownership_error")
+
+            # A reconnect must prove that the token belongs to the mailbox
+            # already configured on this row. Otherwise authenticating a
+            # different Google account leaves the saved IMAP/SMTP usernames
+            # paired with credentials for another identity.
+            verified_email = (
+                email_addr.strip().casefold()
+                if isinstance(email_addr, str)
+                else ""
+            )
+            configured_logins = {
+                value.strip().casefold()
+                for value in (row.imap_user or "", row.smtp_user or "")
+                if value.strip()
+            }
+            if not verified_email or any(
+                login != verified_email for login in configured_logins
+            ):
+                logger.warning(
+                    "Google OAuth mailbox identity verification failed for account %s",
+                    account_id,
+                )
+                return _RR("/?section=integrations&email_oauth_error=identity_verification_failed")
+
             row.oauth_provider = "google"
             row.oauth_access_token = _enc(access_token)
-            if refresh_token:
-                row.oauth_refresh_token = _enc(refresh_token)
+            row.oauth_refresh_token = _enc(refresh_token)
             row.oauth_token_expiry = expiry
             # Auto-fill Google IMAP/SMTP settings if not already configured.
             if not row.imap_host:

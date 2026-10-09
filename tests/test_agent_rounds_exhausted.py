@@ -37,8 +37,14 @@ def _patch_common(monkeypatch):
     monkeypatch.setattr(al, "estimate_tokens", lambda *a, **k: 10, raising=False)
 
     async def _fake_exec(block, *a, **k):
-        return ("bash", {"output": "ok", "exit_code": 0})
+        return (block.tool_type, {"output": "ok", "exit_code": 0})
     monkeypatch.setattr(al, "execute_tool_block", _fake_exec, raising=False)
+
+    # A loop-breaker force-answer round can request a final synthesis. Keep
+    # this loop-control fixture offline through that non-streaming path too.
+    async def _fake_llm_call(*a, **k):
+        return "All done, here is your answer."
+    monkeypatch.setattr("src.llm_core.llm_call_async", _fake_llm_call)
 
 
 def _run_loop(monkeypatch, round_text, max_rounds=2):
@@ -58,8 +64,14 @@ def _run_loop(monkeypatch, round_text, max_rounds=2):
 
 def test_emits_rounds_exhausted_when_cap_hit_mid_task(monkeypatch):
     _patch_common(monkeypatch)
-    # Every round returns a tool block -> never "done" -> loop exhausts the cap.
-    events = _run_loop(monkeypatch, "```bash\necho hi\n```", max_rounds=2)
+    # Use a system-owned interaction result so this remains a loop-control test:
+    # Bash output is workspace-derived and now correctly pauses for exact user
+    # approval before a later Bash call.
+    events = _run_loop(
+        monkeypatch,
+        '```update_plan\n{"plan":"- [ ] keep going"}\n```',
+        max_rounds=2,
+    )
     assert any(e.get("type") == "rounds_exhausted" for e in events), events
 
 
@@ -77,7 +89,8 @@ def test_zero_max_rounds_means_unlimited(monkeypatch):
     async def _fake_stream(_candidates, messages, **kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
-            yield f'data: {json.dumps({"delta": "```bash\necho hi\n```"})}\n\n'
+            delta = "```bash\necho hi\n```"
+            yield f'data: {json.dumps({"delta": delta})}\n\n'
         else:
             yield f'data: {json.dumps({"delta": "Done."})}\n\n'
         yield "data: [DONE]\n\n"
@@ -108,7 +121,11 @@ def test_emits_intent_nudge_exhausted_when_cap_is_exhausted(monkeypatch):
 def test_emits_loop_breaker_triggered_when_loop_breaker_trips(monkeypatch):
     _patch_common(monkeypatch)
 
-    events = _run_loop(monkeypatch, "```bash\necho hi\n```", max_rounds=6)
+    events = _run_loop(
+        monkeypatch,
+        '```update_plan\n{"plan":"- [ ] keep going"}\n```',
+        max_rounds=6,
+    )
 
     guard = next((e for e in events if e.get("type") == "loop_breaker_triggered"), None)
     assert guard is not None, events

@@ -3,7 +3,9 @@
 import asyncio
 import json
 import os
+import base64
 import hashlib
+import io
 import logging
 import re
 import time
@@ -93,6 +95,182 @@ def _push_inpaint_progress(
     events.append(event)
     del events[:-80]
     record["updated_at"] = now
+
+
+_SAM_STATE: Dict[str, Any] = {}
+_GROUNDING_STATE: Dict[str, Any] = {}
+
+
+def _b64_to_pil_image(image_b64: str, *, mode: str = "RGBA"):
+    if not image_b64:
+        raise HTTPException(400, "Missing image")
+    if "," in image_b64 and image_b64.split(",", 1)[0].startswith("data:"):
+        image_b64 = image_b64.split(",", 1)[1]
+    try:
+        from PIL import Image
+
+        raw = base64.b64decode(image_b64)
+        return Image.open(io.BytesIO(raw)).convert(mode)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, "Invalid image") from exc
+
+
+def _pil_image_to_b64(img, *, fmt: str = "PNG") -> str:
+    buf = io.BytesIO()
+    img.save(buf, format=fmt)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _load_sam_backend():
+    model_id = os.getenv("ODYSSEUS_SAM_MODEL", "facebook/sam-vit-base")
+    cached = _SAM_STATE.get(model_id)
+    if cached:
+        return cached
+    try:
+        import torch
+        from transformers import SamModel, SamProcessor
+    except Exception as exc:
+        raise HTTPException(
+            501,
+            "SAM mask tools are not installed. Install Cookbook Dependencies -> SAM mask tools.",
+        ) from exc
+
+    device = "cpu"
+    try:
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            device = "mps"
+    except Exception:
+        device = "cpu"
+
+    try:
+        processor = SamProcessor.from_pretrained(model_id)
+        model = SamModel.from_pretrained(model_id)
+        model.to(device)
+        model.eval()
+    except Exception as exc:
+        raise HTTPException(500, f"Failed to load SAM model {model_id}: {exc}") from exc
+
+    cached = {"torch": torch, "processor": processor, "model": model, "device": device, "model_id": model_id}
+    _SAM_STATE[model_id] = cached
+    return cached
+
+
+def _load_grounding_backend():
+    model_id = os.getenv("ODYSSEUS_GROUNDING_MODEL", "google/owlvit-base-patch32")
+    cached = _GROUNDING_STATE.get(model_id)
+    if cached:
+        return cached
+    try:
+        import torch
+        from transformers import OwlViTForObjectDetection, OwlViTProcessor
+    except Exception as exc:
+        raise HTTPException(
+            501,
+            "Object mask tools are not installed. Install Cookbook Dependencies -> SAM mask tools.",
+        ) from exc
+
+    device = "cpu"
+    try:
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            device = "mps"
+    except Exception:
+        device = "cpu"
+
+    try:
+        processor = OwlViTProcessor.from_pretrained(model_id)
+        model = OwlViTForObjectDetection.from_pretrained(model_id)
+        model.to(device)
+        model.eval()
+    except Exception as exc:
+        raise HTTPException(500, f"Failed to load object mask model {model_id}: {exc}") from exc
+
+    cached = {"torch": torch, "processor": processor, "model": model, "device": device, "model_id": model_id}
+    _GROUNDING_STATE[model_id] = cached
+    return cached
+
+
+def _model_input_to_device(value, device: str, torch):
+    if not hasattr(value, "to"):
+        return value
+    if (
+        device == "mps"
+        and hasattr(torch, "float64")
+        and getattr(value, "dtype", None) == torch.float64
+    ):
+        return value.to(device=device, dtype=torch.float32)
+    return value.to(device)
+
+
+def _model_inputs_to_device(inputs, device: str, torch) -> Dict[str, Any]:
+    return {
+        key: _model_input_to_device(value, device, torch)
+        for key, value in inputs.items()
+    }
+
+
+def _ground_text_to_box(image, text: str, *, threshold: float = 0.05):
+    query = (text or "").strip()
+    if not query:
+        raise HTTPException(400, "Missing object text")
+    backend = _load_grounding_backend()
+    torch = backend["torch"]
+    processor = backend["processor"]
+    model = backend["model"]
+    device = backend["device"]
+
+    labels = [query]
+    if not query.lower().startswith(("a ", "an ", "the ")):
+        labels.append(f"a photo of {query}")
+    try:
+        inputs = processor(text=[labels], images=image, return_tensors="pt")
+        model_inputs = _model_inputs_to_device(inputs, device, torch)
+        with torch.no_grad():
+            outputs = model(**model_inputs)
+        target_sizes = torch.tensor([[image.height, image.width]])
+        if hasattr(processor, "post_process_object_detection"):
+            results = processor.post_process_object_detection(
+                outputs=outputs,
+                target_sizes=target_sizes,
+                threshold=float(threshold),
+            )
+        elif hasattr(processor, "post_process_grounded_object_detection"):
+            results = processor.post_process_grounded_object_detection(
+                outputs=outputs,
+                target_sizes=target_sizes,
+                threshold=float(threshold),
+                text_labels=[labels],
+            )
+        else:
+            raise HTTPException(500, "Installed Transformers does not expose OWL-ViT object detection post-processing")
+        boxes = results[0].get("boxes")
+        scores = results[0].get("scores")
+        labels_idx = results[0].get("labels")
+        text_labels = results[0].get("text_labels") or results[0].get("labels_text")
+        if boxes is None or scores is None or len(boxes) == 0:
+            raise HTTPException(404, f"No visible object matched '{query}'")
+        idx = int(torch.argmax(scores).item())
+        box = [float(v) for v in boxes[idx].detach().cpu().tolist()]
+        label_idx = int(labels_idx[idx].detach().cpu().item()) if labels_idx is not None and len(labels_idx) else 0
+        label = labels[min(label_idx, len(labels) - 1)]
+        if text_labels and len(text_labels) > idx:
+            label = str(text_labels[idx])
+        return {
+            "box": box,
+            "score": float(scores[idx].detach().cpu().item()),
+            "label": label,
+            "model": backend["model_id"],
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("ground_text_to_box failed")
+        raise HTTPException(500, f"Object mask failed: {exc}") from exc
 
 
 def _current_user_is_admin(request: Request, user: str | None) -> bool:
@@ -1783,7 +1961,11 @@ def setup_gallery_routes() -> APIRouter:
                 progress("failed", "OpenAI inpaint timed out.", percent=100, done=True, error=True)
                 raise HTTPException(504, "OpenAI inpaint timed out (120s)")
 
-        # Self-hosted diffusion server path
+        # Self-hosted diffusion server path. Newer Odysseus image
+        # wrappers expose the OpenAI-compatible /v1/images/edits
+        # multipart route even when they are local/self-hosted. Older
+        # diffusion_server.py exposes /v1/images/inpaint as JSON. Try the
+        # OpenAI-compatible local route first, then fall back.
         try:
             # Forward chosen_model so the diffusion server can route if it ever
             # supports multiple models per process. Harmless if ignored.
@@ -1812,6 +1994,28 @@ def setup_gallery_routes() -> APIRouter:
                         payload.setdefault("n", 1)
                     try:
                         progress("model_wait", f"Trying {path} on the image endpoint.", percent=64 + idx * 3)
+                        if path == "/images/edits":
+                            source_png = _b64_to_pil_image(body["image"], mode="RGBA")
+                            mask_png = _b64_to_pil_image(body["mask"], mode="L")
+                            src_buf, mask_buf = io.BytesIO(), io.BytesIO()
+                            source_png.save(src_buf, format="PNG")
+                            mask_png.save(mask_buf, format="PNG")
+                            files = {
+                                "image": ("source.png", src_buf.getvalue(), "image/png"),
+                                "mask": ("mask.png", mask_buf.getvalue(), "image/png"),
+                            }
+                            data = {
+                                "model": chosen_model or body.get("model") or "",
+                                "prompt": body.get("prompt", ""),
+                                "size": f"{int(body.get('width') or source_png.width)}x{int(body.get('height') or source_png.height)}",
+                                "n": "1",
+                            }
+                            multipart_response = await client.post(target, data=data, files=files)
+                            if 200 <= multipart_response.status_code < 300:
+                                image_b64, _ = await _normalized_provider_image_response(multipart_response.text, client)
+                                if image_b64:
+                                    progress("backend_complete", "Backend response is ready.", percent=88, done=True)
+                                    return {"image": image_b64}
                         r = await client.post(target, json=payload)
                     except httpx.TimeoutException:
                         raise
@@ -2175,6 +2379,132 @@ def setup_gallery_routes() -> APIRouter:
             return {"error": "AI upscale failed"}
 
     # ---- POST /api/image/remove-bg ----
+    @router.post("/api/image/mask")
+    async def smart_mask(request: Request):
+        """Create a neutral segmentation mask from user-provided points or a box.
+
+        This endpoint intentionally does not inspect edit prompts. It only
+        turns explicit visual selection hints into a binary mask that the
+        editor can reuse for wand/layer-mask/inpaint workflows.
+        """
+        require_privilege(request, "can_generate_images")
+        body = await request.json()
+        image = _b64_to_pil_image(body.get("image") or "", mode="RGB")
+        points = body.get("points") or []
+        box = body.get("box")
+        text = (body.get("text") or body.get("query") or "").strip()
+        grounded = None
+
+        if not points and not box and text:
+            grounded = _ground_text_to_box(image, text)
+            box = grounded["box"]
+
+        if not points and not box:
+            raise HTTPException(400, "Provide at least one point, box, or object text")
+
+        backend = _load_sam_backend()
+        torch = backend["torch"]
+        processor = backend["processor"]
+        model = backend["model"]
+        device = backend["device"]
+
+        kwargs: Dict[str, Any] = {"return_tensors": "pt"}
+        input_points = []
+        if points:
+            input_labels = []
+            for p in points:
+                try:
+                    input_points.append([float(p["x"]), float(p["y"])])
+                    input_labels.append(int(p.get("label", 1)))
+                except Exception as exc:
+                    raise HTTPException(400, "Invalid point format") from exc
+            kwargs["input_points"] = [input_points]
+            kwargs["input_labels"] = [input_labels]
+        if box:
+            if not isinstance(box, list) or len(box) != 4:
+                raise HTTPException(400, "Box must be [x1, y1, x2, y2]")
+            try:
+                kwargs["input_boxes"] = [[[float(v) for v in box]]]
+            except Exception as exc:
+                raise HTTPException(400, "Invalid box format") from exc
+
+        try:
+            inputs = processor(image, **kwargs)
+            model_inputs = _model_inputs_to_device(inputs, device, torch)
+            with torch.no_grad():
+                outputs = model(**model_inputs)
+            masks = processor.image_processor.post_process_masks(
+                outputs.pred_masks.detach().cpu(),
+                inputs["original_sizes"].detach().cpu(),
+                inputs["reshaped_input_sizes"].detach().cpu(),
+            )
+            mask_tensor = masks[0]
+            while getattr(mask_tensor, "ndim", 0) > 3:
+                mask_tensor = mask_tensor[0]
+            if getattr(mask_tensor, "ndim", 0) == 3:
+                scores = outputs.iou_scores.detach().cpu()[0]
+                while getattr(scores, "ndim", 0) > 1:
+                    scores = scores[0]
+                # SAM commonly returns multiple candidates for a click. The
+                # highest-IoU candidate can be the entire image, which is
+                # useless as an editor selection. Prefer a candidate that
+                # contains the clicked point while keeping area reasonable.
+                point_xy = None
+                if input_points:
+                    try:
+                        point_xy = (
+                            int(round(float(input_points[0][0]))),
+                            int(round(float(input_points[0][1]))),
+                        )
+                    except Exception:
+                        point_xy = None
+                best_idx = 0
+                best_rank = None
+                total_px = max(1, int(mask_tensor.shape[-1]) * int(mask_tensor.shape[-2]))
+                for i in range(int(mask_tensor.shape[0])):
+                    candidate = mask_tensor[i]
+                    area_ratio = float(candidate.sum().item()) / float(total_px)
+                    if area_ratio >= 0.985:
+                        continue
+                    contains_click = True
+                    if point_xy:
+                        px = max(0, min(int(candidate.shape[-1]) - 1, point_xy[0]))
+                        py = max(0, min(int(candidate.shape[-2]) - 1, point_xy[1]))
+                        contains_click = bool(candidate[py, px].item())
+                    if not contains_click:
+                        continue
+                    score = float(scores[min(i, len(scores) - 1)].item()) if len(scores) else 0.0
+                    # Strongly penalize broad masks; a click-selection should
+                    # usually be local unless the user gives a box.
+                    rank = score - (area_ratio * 0.35)
+                    if best_rank is None or rank > best_rank:
+                        best_rank = rank
+                        best_idx = i
+                if best_rank is None and len(scores):
+                    best_idx = int(torch.argmax(scores).item())
+                mask_tensor = mask_tensor[min(best_idx, mask_tensor.shape[0] - 1)]
+            mask_array = (mask_tensor.numpy() > 0).astype("uint8") * 255
+            from PIL import Image
+
+            mask_img = Image.fromarray(mask_array, mode="L")
+            if mask_img.size != image.size:
+                mask_img = mask_img.resize(image.size, Image.NEAREST)
+            bbox = mask_img.getbbox()
+            result = {
+                "mask": _pil_image_to_b64(mask_img),
+                "bbox": list(bbox) if bbox else None,
+                "model": backend["model_id"],
+                "device": device,
+            }
+            if grounded:
+                result["grounding"] = grounded
+            return result
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception("smart_mask failed")
+            raise HTTPException(500, f"SAM mask failed: {exc}") from exc
+
     @router.post("/api/image/remove-bg")
     async def remove_background(request: Request):
         """Remove background from an image. If the client passes a `hint_mask`

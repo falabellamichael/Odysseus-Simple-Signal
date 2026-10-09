@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 
 from tests.helpers.css_loader import read_css_with_imports
 
@@ -129,7 +130,10 @@ def test_gallery_tool_sheet_dismiss_restores_layer_peek():
 
 
 def test_gallery_editor_cache_bumped_for_android_assets():
-    assert "const CACHE_NAME = 'odysseus-v429';" in SW_JS
+    cache = re.search(r"const CACHE_NAME = ['\"]odysseus-v(\d+)[^'\"]*['\"];", SW_JS)
+    assert cache, "service worker must define a versioned app cache"
+    assert int(cache.group(1)) > 429, "editor assets must invalidate the previous v429 cache"
+    assert "keys.filter(k => k !== CACHE_NAME).map(k => caches.delete(k))" in SW_JS
 
 
 def test_gallery_fit_zoom_uses_visible_canvas_above_mobile_layers_sheet():

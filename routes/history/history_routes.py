@@ -6,13 +6,14 @@ import logging
 import re
 from typing import Dict, Any, Optional
 
-from fastapi import APIRouter, Request, HTTPException
+from fastapi import APIRouter, Request, HTTPException, Depends
 
 from core.models import ChatMessage
 from core.database import SessionLocal, ChatMessage as DbChatMessage, Session as DbSession
-from src.auth_helpers import effective_user
+from src.auth_helpers import effective_user, require_chat_api_token_scope
 from src.topic_analyzer import analyze_topics
 from src.upload_handler import reserve_message_upload_references
+from src.tool_approval_scopes import sanitize_client_message_metadata
 from routes.session_routes import (
     _message_role,
     _message_text,
@@ -101,7 +102,11 @@ def _merge_continue_rows_to_delete(db_messages, db1, db2):
 
 
 def setup_history_routes(session_manager, upload_handler=None) -> APIRouter:
-    router = APIRouter(tags=["history"])
+    router = APIRouter(
+        tags=["history"],
+        dependencies=[Depends(require_chat_api_token_scope)],
+    )
+
 
     def _reserve_message_uploads(
         request: Request,
@@ -160,6 +165,8 @@ def setup_history_routes(session_manager, upload_handler=None) -> APIRouter:
                 )
                 page_offset = int(offset) if offset is not None else max(total - page_limit, 0)
                 page_offset = max(0, min(page_offset, total))
+                # Keep display pagination page-scoped. ``get_session`` is the
+                # full model-context hydration seam and must not be entered here.
                 rows = (
                     db.query(DbChatMessage)
                     .filter(DbChatMessage.session_id == session_id)
@@ -212,7 +219,10 @@ def setup_history_routes(session_manager, upload_handler=None) -> APIRouter:
                     entry["metadata"] = msg["metadata"]
                 history_dict.append(entry)
 
-        # Fallback: load from DB if in-memory is empty
+        # Fallback: load from DB if in-memory renders empty. Display only —
+        # get_session above is the hydration seam, so nothing here writes back
+        # into session.history — rebuilding it from raw rows would overwrite
+        # parsed multimodal content and the _db_id edit/delete keys it just set.
         if not history_dict:
             db = SessionLocal()
             try:
@@ -222,20 +232,10 @@ def setup_history_routes(session_manager, upload_handler=None) -> APIRouter:
                     .order_by(DbChatMessage.timestamp)
                     .all()
                 )
-                db_history = []
-                for m in db_messages:
-                    db_history.append(_db_history_entry(m))
-                if db_history:
-                    # Rebuild in-memory history from the full set so hidden
-                    # messages (e.g. compaction summaries) are kept for AI context.
-                    session.history = [
-                        ChatMessage(role=m["role"], content=m["content"], metadata=m.get("metadata"))
-                        for m in db_history
-                    ]
                 # Response excludes hidden messages, matching the in-memory path.
                 history_dict = [
-                    m for m in db_history
-                    if not (m.get("metadata") or {}).get("hidden")
+                    entry for entry in (_db_history_entry(m) for m in db_messages)
+                    if not (entry.get("metadata") or {}).get("hidden")
                 ]
             except Exception as e:
                 logger.error(f"DB fallback failed for {session_id}: {e}")
@@ -273,7 +273,7 @@ def setup_history_routes(session_manager, upload_handler=None) -> APIRouter:
             content = body.get("content", "")
             if not content:
                 raise HTTPException(400, "content is required")
-            metadata = body.get("metadata")
+            metadata = sanitize_client_message_metadata(body.get("metadata"))
             _reserve_message_uploads(request, content, metadata)
             msg = ChatMessage(role=role, content=content, metadata=metadata)
             session_manager.add_message(session_id, msg)
@@ -602,8 +602,14 @@ def setup_history_routes(session_manager, upload_handler=None) -> APIRouter:
             body = await request.json()
             keep_count = body.get("keep_count", 0)
 
-            # Get the source session
-            source = session_manager.sessions.get(session_id)
+            # Get the source session. keep_count indexes into source.history,
+            # so this must go through get_session — reading the cache directly
+            # forks an empty transcript out of a metadata-only session after a
+            # restart (display pagination no longer hydrates it).
+            try:
+                source = session_manager.get_session(session_id)
+            except KeyError:
+                raise HTTPException(404, "Session not found")
             if not source:
                 raise HTTPException(404, "Session not found")
 
@@ -656,6 +662,55 @@ def setup_history_routes(session_manager, upload_handler=None) -> APIRouter:
         except Exception as e:
             raise HTTPException(500, f"Topic analysis failed: {e}")
 
+    @router.get("/api/session/{session_id}/context")
+    async def get_session_context_usage(request: Request, session_id: str) -> Dict[str, Any]:
+        """Return an estimated whole-chat context usage for the session's model.
+
+        Streaming footers report the prompt size for the last request. This
+        endpoint estimates the persisted session context so the header can show
+        when the whole chat is approaching compaction.
+        """
+        _verify_session_owner(request, session_id)
+        try:
+            session = session_manager.get_session(session_id)
+        except KeyError:
+            raise HTTPException(404, "Session not found")
+
+        try:
+            from src.model_context import estimate_tokens, get_context_length
+
+            messages = session.get_context_messages()
+            used = int(estimate_tokens(messages))
+            ctx_len = int(get_context_length(session.endpoint_url, session.model) or 0)
+            pct = round((used / ctx_len) * 100, 1) if ctx_len else 0.0
+            pct = max(0.0, min(100.0, pct))
+            visible_messages = sum(
+                1 for m in session.history
+                if not (getattr(m, "metadata", None) or {}).get("hidden")
+            )
+            compacted_messages = sum(
+                1 for m in session.history
+                if (getattr(m, "metadata", None) or {}).get("compacted")
+            )
+            can_compact = used > 0
+            return {
+                "session_id": session_id,
+                "model": session.model,
+                "endpoint_url": session.endpoint_url,
+                "used_tokens": used,
+                "context_length": ctx_len,
+                "context_percent": pct,
+                "messages": visible_messages,
+                "context_messages": len(messages),
+                "compacted_messages": compacted_messages,
+                "can_compact": can_compact,
+                "should_compact": pct >= 70,
+                "auto_compact_threshold": 85,
+            }
+        except Exception as e:
+            logger.error(f"Context usage error {session_id}: {e}")
+            raise HTTPException(500, str(e))
+
     @router.post("/api/session/{session_id}/compact")
     async def compact_session(request: Request, session_id: str):
         """Manually trigger context compaction for a session."""
@@ -700,7 +755,7 @@ def setup_history_routes(session_manager, upload_handler=None) -> APIRouter:
             compact_model = util_model or session.model
             compact_headers = util_headers if util_url else session.headers
 
-            from src.context_compactor import SELF_SUMMARY_SYSTEM_PROMPT
+            from src.context_compactor import SELF_SUMMARY_SYSTEM_PROMPT, normalize_compaction_summary
             compaction_count = sum(1 for m in session.history if isinstance(m, ChatMessage) and "[Conversation summary" in (m.content or ""))
             sys_prompt = SELF_SUMMARY_SYSTEM_PROMPT.replace("{count}", str(len(older))).replace("{n}", str(compaction_count + 1))
             summary = await llm_call_async(
@@ -712,6 +767,7 @@ def setup_history_routes(session_manager, upload_handler=None) -> APIRouter:
                 temperature=0.2, max_tokens=1024,
                 headers=compact_headers, timeout=30,
             )
+            summary = normalize_compaction_summary(summary)
 
             # Replace session history: summary as system message + recent messages
             # System message holds the full summary for AI context

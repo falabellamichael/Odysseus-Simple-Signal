@@ -4,16 +4,24 @@ import html
 import json
 import uuid
 from datetime import datetime
-from fastapi import APIRouter, Form, HTTPException, Response, Request
+from fastapi import APIRouter, Form, HTTPException, Response, Request, Depends
 import logging
 
 from core.session_manager import SessionManager
 from core.models import ChatMessage
 from src.request_models import SessionResponse
 from core.database import Session as DbSession, SessionLocal, Document, GalleryImage, utcnow_naive
-from src.auth_helpers import effective_user, _auth_disabled, owner_filter
+from src.auth_helpers import (
+    effective_user,
+    _auth_disabled,
+    owner_filter,
+    is_delegated_credential,
+    require_chat_api_token_scope,
+)
+from src.session_image_cleanup import _generated_image_path_for_cleanup, session_image_refs
 from src.session_actions import is_session_recently_active
 from src.upload_handler import reserve_message_upload_references
+from src.tool_approval_scopes import sanitize_client_message_metadata
 
 
 def _sanitize_export_filename(name: str) -> str:
@@ -123,9 +131,15 @@ def _verify_session_owner(request: Request, session_id: str, session_manager=Non
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api", tags=["sessions"])
+router = APIRouter(
+    prefix="/api",
+    tags=["sessions"],
+    dependencies=[Depends(require_chat_api_token_scope)],
+)
 
 def _current_user_is_admin(request: Request, user: str | None) -> bool:
+    if is_delegated_credential(request):
+        return False
     if not user:
         return False
     auth_mgr = getattr(request.app.state, "auth_manager", None)
@@ -154,6 +168,22 @@ def _reject_raw_endpoint_url_for_non_admin(
     # endpoint validation have already happened.
     if user and not _current_user_is_admin(request, user):
         raise HTTPException(403, "Choose a registered model endpoint")
+
+
+def _reject_delegated_session_options(
+    request: Request,
+    *,
+    skip_validation: bool = False,
+    api_key: str | None = None,
+) -> None:
+    """Keep bearer credentials from exercising interactive-admin options."""
+    if is_delegated_credential(request) and (
+        skip_validation or bool((api_key or "").strip())
+    ):
+        raise HTTPException(
+            403,
+            "API tokens cannot supply endpoint credentials or skip endpoint validation",
+        )
 
 
 def _persist_session_headers(session_id: str, headers: dict | None) -> None:
@@ -220,6 +250,7 @@ def setup_session_routes(
     @router.get("/sessions")
     def list_sessions(request: Request):
         user = effective_user(request)
+        active_incognito_id = str(request.query_params.get("active_incognito_id") or "").strip()
         # Lazy purge: incognito sessions are ephemeral by design — wipe leftovers
         # from the DB and session_manager so they vanish on the next page refresh.
         # BUT: skip sessions that were created within the last 10 minutes.
@@ -240,6 +271,8 @@ def setup_session_routes(
                     DbSession.created_at < _cutoff,
                 ).all()
                 for _g in _ghosts:
+                    if active_incognito_id and _g.id == active_incognito_id:
+                        continue
                     _purge_db.query(_DbMsg).filter(_DbMsg.session_id == _g.id).delete()
                     _purge_db.delete(_g)
                     if hasattr(session_manager, "delete_session"):
@@ -336,6 +369,11 @@ def setup_session_routes(
     ):
         skip_val = str(skip_validation).lower() == "true"
         user = effective_user(request)
+        _reject_delegated_session_options(
+            request,
+            skip_validation=skip_val,
+            api_key=api_key,
+        )
         endpoint_api_key = ""
         endpoint_base_url = ""
         _reject_raw_endpoint_url_for_non_admin(request, user, endpoint_id, endpoint_url)
@@ -560,7 +598,11 @@ def setup_session_routes(
         except (AttributeError, TypeError, ValueError) as exc:
             raise HTTPException(400, "Invalid message attachment metadata") from exc
         for m in messages:
-            sess.add_message(ChatMessage(m["role"], m["content"], metadata=m.get("metadata")))
+            sess.add_message(ChatMessage(
+                m["role"],
+                m["content"],
+                metadata=sanitize_client_message_metadata(m.get("metadata")),
+            ))
         session_manager.save_sessions()
         return {"ok": True, "count": len(messages)}
 
@@ -641,13 +683,43 @@ def setup_session_routes(
         db = SessionLocal()
         try:
             from core.database import ChatMessage as DbChatMessage
+            session_ids = [row[0] for row in db.query(DbSession.id).all()]
             count = db.query(DbSession).count()
+            image_ids: set[str] = set()
+            filenames: set[str] = set()
+            for sid in session_ids:
+                ids, names = session_image_refs(db, sid)
+                image_ids.update(ids)
+                filenames.update(names)
+            image_query = db.query(GalleryImage).filter(GalleryImage.session_id.in_(session_ids)) if session_ids else db.query(GalleryImage).filter(False)
+            if image_ids or filenames:
+                from sqlalchemy import or_
+                clauses = []
+                if session_ids:
+                    clauses.append(GalleryImage.session_id.in_(session_ids))
+                if image_ids:
+                    clauses.append(GalleryImage.id.in_(list(image_ids)))
+                if filenames:
+                    clauses.append(GalleryImage.filename.in_(list(filenames)))
+                image_query = db.query(GalleryImage).filter(or_(*clauses))
+            images = image_query.all()
+            removed_images = 0
+            for img in images:
+                img.is_active = False
+                if img.filename:
+                    path = _generated_image_path_for_cleanup(img.filename)
+                    if path and path.exists():
+                        try:
+                            path.unlink()
+                        except Exception as exc:
+                            logger.warning("Could not remove generated image %s during all-session delete: %s", img.filename, exc)
+                removed_images += 1
             db.query(DbChatMessage).delete()
             db.query(DbSession).delete()
             db.commit()
             session_manager.sessions.clear()
-            logger.info(f"Admin deleted all {count} sessions")
-            return {"status": "deleted", "count": count}
+            logger.info(f"Admin deleted all {count} sessions and {removed_images} linked images")
+            return {"status": "deleted", "count": count, "images_deleted": removed_images}
         except Exception as e:
             db.rollback()
             logger.error(f"Error deleting all sessions: {e}")
@@ -767,15 +839,6 @@ def setup_session_routes(
         finally:
             db.close()
 
-    @router.get("/history/{sid}")
-    def get_history(request: Request, sid: str):
-        _verify_session_owner(request, sid)
-        try:
-            session = session_manager.get_session(sid)
-        except KeyError:
-            raise HTTPException(404, f"Session {sid} not found")
-        return {"history": [msg.to_dict() for msg in session.history]}
-    
     @router.get("/session/{sid}/export")
     def export_session(request: Request, sid: str, fmt: str = "md", filename: str = ""):
         """Export conversation history as a downloadable file.
@@ -881,6 +944,8 @@ def setup_session_routes(
         model: str = Form("gpt-4o"),
         rag: str = Form(None)
     ):
+        if is_delegated_credential(request):
+            raise HTTPException(403, "This session type requires an interactive session")
         if not OPENAI_API_KEY:
             raise HTTPException(400, "Server missing OPENAI_API_KEY")
         sid = str(uuid.uuid4())

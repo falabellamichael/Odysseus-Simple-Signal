@@ -9,22 +9,44 @@ import logging
 from datetime import datetime
 from typing import Dict, Any, AsyncGenerator, List, Optional
 
-from fastapi import APIRouter, Request, HTTPException, Form, Query
+from fastapi import APIRouter, Request, HTTPException, Form, Query, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 
 from core.models import ChatMessage
 from src.request_models import ChatRequest
-from src.llm_core import llm_call_async, stream_llm, stream_llm_with_fallback
+from src.llm_core import (
+    _normalize_http_status,
+    llm_call_async,
+    llm_call_async_with_route_fallback,
+    stream_llm,
+    stream_llm_with_fallback,
+)
 from src.agent_loop import stream_agent_loop
 from src import agent_runs
 from src.model_context import estimate_tokens
+from src.context_compactor import (
+    apply_compaction_state,
+    maybe_compact,
+    trim_for_context,
+)
 from src.chat_helpers import coerce_message_and_session
 from src.endpoint_resolver import normalize_base as _normalize_base, build_chat_url
+from src.foreground_model_routing import (
+    build_foreground_model_candidates,
+    build_foreground_route_descriptors,
+    resolve_foreground_model_policy,
+)
 from src.session_search import search_session_messages
 from src.prompt_security import untrusted_context_message
 from core.exceptions import SessionNotFoundError
-from src.auth_helpers import effective_user, get_current_user
+from src.auth_helpers import (
+    effective_user,
+    get_current_user,
+    is_delegated_credential,
+    require_api_token_scope,
+    require_chat_api_token_scope,
+)
 from routes.session_routes import _verify_session_owner
 from routes.document_helpers import _owner_session_filter
 from core.database import SessionLocal, get_session_mode, set_session_mode
@@ -38,11 +60,22 @@ from routes.chat_helpers import (
     build_chat_context,
     save_assistant_response,
     run_post_response_tasks,
+    accumulate_token_usage,
     clean_thinking_for_save,
+    _allowed_models_for_request,
     _enforce_chat_privileges,
 )
 from src.action_intents import ToolIntent, classify_tool_intent as _classify_tool_intent
-from src.tool_policy import build_effective_tool_policy
+from src.image_model_ids import looks_like_image_generation_model
+from src.tool_policy import (
+    WEB_TOOL_NAMES,
+    build_effective_tool_policy,
+    is_web_search_explicitly_denied,
+    web_search_enabled_for_turn,
+)
+from src.tool_approvals import tool_approval_store
+from src.tool_approval_scopes import stamp_chat_session_grant
+from src.tool_security import delegated_credential_blocked_tools
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +115,156 @@ _MEDIA_RESULT_KEYS = (
     "image_url", "image_id", "image_prompt", "image_model", "image_size",
     "image_quality",
 )
+
+
+
+def _stream_failure_status(chunk: str) -> Optional[int]:
+    """Extract a provider status without retaining provider-supplied detail."""
+
+    try:
+        for line in str(chunk or "").splitlines():
+            if not line.startswith("data: "):
+                continue
+            status = json.loads(line[6:]).get("status")
+            return _normalize_http_status(status)
+    except json.JSONDecodeError:
+        return None
+    return None
+
+
+def _reject_delegated_tool_approval(request: Request) -> None:
+    """Refuse an approval answered by a bearer API token.
+
+    A tool approval records that a HUMAN authorized one dangerous action. A
+    token is a delegated credential handed to an integration, so when it
+    answers the prompt it triggered, nobody is asked and the gate collapses
+    into an extra round trip. Owner and session already match here: the token
+    is answering on behalf of the account that minted it.
+    """
+    if is_delegated_credential(request):
+        raise HTTPException(
+            403,
+            "Tool approvals require an interactive session. "
+            "API tokens cannot authorize a gated action.",
+        )
+
+
+def _mark_tool_approval_resolved(sess, approval_id: Any, decision: Any) -> bool:
+    """Persist a consumed approval decision on its existing tool event."""
+
+    approval_key = str(approval_id or "")
+    normalized_decision = str(decision or "").strip().lower()
+    if not approval_key or normalized_decision not in {"approve", "approve_task", "deny"}:
+        return False
+
+    message_id = None
+    resolved_metadata = None
+    for item in reversed(getattr(sess, "history", []) or []):
+        metadata = getattr(item, "metadata", None)
+        if not isinstance(metadata, dict):
+            continue
+        tool_events = metadata.get("tool_events")
+        if not isinstance(tool_events, list):
+            continue
+        for event in reversed(tool_events):
+            ask_user = event.get("ask_user") if isinstance(event, dict) else None
+            if not isinstance(ask_user, dict):
+                continue
+            if str(ask_user.get("approval_id") or "") != approval_key:
+                continue
+            ask_user["resolved"] = normalized_decision
+            stamp_chat_session_grant(
+                ask_user,
+                getattr(sess, "id", ""),
+                normalized_decision,
+            )
+            message_id = metadata.get("_db_id")
+            resolved_metadata = {
+                key: value for key, value in metadata.items() if key != "_db_id"
+            }
+            break
+        if resolved_metadata is not None:
+            break
+
+    if resolved_metadata is None or not message_id:
+        return False
+
+    db = SessionLocal()
+    try:
+        db_message = db.query(DBChatMessage).filter(
+            DBChatMessage.id == message_id,
+            DBChatMessage.session_id == str(getattr(sess, "id", "")),
+        ).first()
+        if db_message is None:
+            return False
+        db_message.meta_data = json.dumps(resolved_metadata)
+        db.commit()
+        return True
+    except Exception:
+        db.rollback()
+        logger.exception("Failed to persist tool approval resolution")
+        return False
+    finally:
+        db.close()
+
+
+async def _tool_approval_resolution_stream(decision: str) -> AsyncGenerator[str, None]:
+    yield f"data: {json.dumps({'type': 'tool_approval_resolved', 'decision': decision})}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+def _chat_candidate_request_factory(
+    messages,
+    fallback_context_length: int = 0,
+    *,
+    session=None,
+    owner: Optional[str] = None,
+):
+    """Shape one route-neutral Chat prompt for each candidate window."""
+
+    state = {
+        "requests": {},
+        "context_lengths": {},
+        "trim_stats": {},
+        "compactions": {},
+        "was_compacted": {},
+    }
+
+    async def factory(index, candidate_url, candidate_model, candidate_headers):
+        compaction_state = {}
+        candidate_messages, context_length, was_compacted = await maybe_compact(
+            session,
+            candidate_url,
+            candidate_model,
+            list(messages),
+            candidate_headers,
+            owner=owner,
+            persist=False,
+            compaction_state=compaction_state,
+        )
+        if not context_length:
+            context_length = fallback_context_length
+        request_messages = trim_for_context(candidate_messages, context_length)
+        state["requests"][index] = request_messages
+        state["context_lengths"][index] = context_length
+        state["compactions"][index] = compaction_state
+        state["was_compacted"][index] = was_compacted
+        state["trim_stats"][index] = {
+            "messages_before": len(messages),
+            "messages_after": len(request_messages),
+            "tokens_before": estimate_tokens(messages),
+            "tokens_after": estimate_tokens(request_messages),
+        }
+        return {"messages": request_messages}
+
+    return factory, state
+
+
+def _candidate_index(candidates, actual_candidate) -> int:
+    for index, candidate in enumerate(candidates):
+        if candidate == actual_candidate:
+            return index
+    return 0
 
 
 def _stream_set(session_id: str, **fields) -> None:
@@ -139,7 +322,8 @@ def _ensure_current_request_is_latest_user(messages: List[Dict[str, Any]], curre
 _WEB_FOLLOWUP_RE = re.compile(
     r"^\s*(?:(?:can|could|would|will)\s+you\s+)?"
     r"(?:check|try\s+again|look(?:\s+now|\s+it\s+up)?|search(?:\s+now|\s+online|\s+it)?|"
-    r"do\s+it|again)\??\s*$",
+    r"do\s+it|again|approved|approve(?:d)?|yes|ok(?:ay)?|proceed|go\s+ahead|"
+    r"send(?:\s+it)?|submit(?:\s+it)?|email(?:\s+them|\s+it)?)\??\s*$",
     re.I,
 )
 _RECENT_WEB_CONTEXT_RE = re.compile(
@@ -147,6 +331,26 @@ _RECENT_WEB_CONTEXT_RE = re.compile(
     r"price|current|latest|search|look\s+up|online)\b",
     re.I,
 )
+_RECENT_BROWSER_CONTEXT_RE = re.compile(
+    r"\b(?:browser|browse|open\s+(?:the\s+)?(?:site|page|url|link)|click|"
+    r"fill(?:\s+out)?|submit|send\s+(?:the\s+)?form|contact\s+form|web\s*form|"
+    r"form\s+submission|playwright|automation)\b",
+    re.I,
+)
+_BROWSER_MCP_TOOLS = {
+    "mcp__builtin_browser__browser_navigate",
+    "mcp__builtin_browser__browser_snapshot",
+    "mcp__builtin_browser__browser_click",
+    "mcp__builtin_browser__browser_type",
+    "mcp__builtin_browser__browser_fill_form",
+    "mcp__builtin_browser__browser_select_option",
+    "mcp__builtin_browser__browser_press_key",
+    "mcp__builtin_browser__browser_wait_for",
+    "mcp__builtin_browser__browser_take_screenshot",
+    "mcp__builtin_browser__browser_drag",
+    "mcp__builtin_browser__browser_navigate_back",
+    "mcp__builtin_browser__browser_close",
+}
 
 
 def _recent_session_text(sess, limit: int = 8, max_chars: int = 2000) -> str:
@@ -167,6 +371,13 @@ def _is_contextual_web_followup(message: str, sess) -> bool:
     if not message or not _WEB_FOLLOWUP_RE.search(message):
         return False
     return bool(_RECENT_WEB_CONTEXT_RE.search(_recent_session_text(sess)))
+
+
+def _is_contextual_browser_followup(message: str, sess) -> bool:
+    """Treat short retry replies as browser tasks when recent context was forms/browser automation."""
+    if not message or not _WEB_FOLLOWUP_RE.search(message):
+        return False
+    return bool(_RECENT_BROWSER_CONTEXT_RE.search(_recent_session_text(sess, limit=12, max_chars=4000)))
 
 
 def _resolve_request_workspace(request, raw_value) -> tuple:
@@ -228,6 +439,45 @@ def _message_mentions_workspace_files(message: Any) -> bool:
         _WORKSPACE_FILE_ACTION_RE.search(text)
         and _WORKSPACE_FILE_TARGET_RE.search(text)
     )
+
+_ABS_PATH_RE = re.compile(r"(?<!\S)(~?/[^\"'\s`<>]+)")
+_LOCAL_FILE_TASK_RE = re.compile(
+    r"\b(?:file|folder|directory|path|workspace|repo|project|movie|video|"
+    r"subtitle|subtitles|srt|vtt|ass|download|save|rename|move|copy|extract|"
+    r"convert|ffmpeg|run|execute|open|read|inspect|fix|debug|test|build)\b",
+    re.IGNORECASE,
+)
+
+
+def _resolve_workspace_from_message_path(request, message: str) -> tuple[str, str]:
+    """Auto-bind a workspace only when the user names an explicit safe path.
+
+    This is intentionally deterministic rather than LLM/RAG-driven: RAG can
+    choose the tool family, but filesystem binding must not let a prompt infer
+    or probe arbitrary host paths. For a file path, bind its parent directory.
+    For a directory path, bind that directory.
+    """
+    text = str(message or "")
+    if not text or not _LOCAL_FILE_TASK_RE.search(text):
+        return "", ""
+
+    from src.tool_security import owner_is_admin_or_single_user
+    if not owner_is_admin_or_single_user(get_current_user(request)):
+        return "", ""
+
+    from src.tool_execution import vet_workspace
+
+    for match in _ABS_PATH_RE.finditer(text):
+        raw = match.group(1).rstrip(".,;:)]}")
+        expanded = os.path.realpath(os.path.expanduser(raw))
+        candidates = [expanded]
+        if os.path.isfile(expanded):
+            candidates.insert(0, os.path.dirname(expanded))
+        for candidate in candidates:
+            workspace = vet_workspace(candidate) or ""
+            if workspace:
+                return workspace, ""
+    return "", ""
 
 
 def _session_url_matches_endpoint(session_url: str, endpoint_base: str) -> bool:
@@ -306,7 +556,7 @@ def _is_image_generation_session(sess, owner: str | None = None) -> bool:
     """
     model = (getattr(sess, "model", "") or "").strip()
     model_l = model.lower()
-    if any(model.lower().startswith(prefix) for prefix in _IMAGE_MODEL_PREFIXES):
+    if looks_like_image_generation_model(model):
         return True
     if "image" in model_l and any(term in model_l for term in ("gemini", "qwen", "flux", "imagen")):
         return True
@@ -436,10 +686,11 @@ def _resolve_chat_stream_fallback_candidates(messages: list | None, owner: str |
             logger.debug("Could not resolve vision fallback candidates: %s", e)
         candidates.extend(_resolve_auto_vision_fallback_candidates(owner=owner))
     try:
-        from src.endpoint_resolver import resolve_chat_fallback_candidates
-        candidates.extend(resolve_chat_fallback_candidates(owner=owner))
+        policy = resolve_foreground_model_policy(owner=owner)
+        if policy.enabled:
+            candidates.extend(policy.fallback_candidates)
     except Exception as e:
-        logger.debug("Could not resolve chat fallback candidates: %s", e)
+        logger.debug("Could not resolve foreground fallback candidates: %s", e)
     return candidates
 
 
@@ -490,6 +741,28 @@ async def _generate_direct_media(kind: str, prompt: str, session_id: str, owner:
         owner=owner,
         session_id=session_id,
     )
+
+def _first_image_attachment(chat_handler, att_ids: List[str], owner: str | None = None) -> Optional[Dict[str, Any]]:
+    """Return the first attached image file that this owner can read."""
+    upload_handler = getattr(chat_handler, "upload_handler", None)
+    if not upload_handler:
+        return None
+    for att_id in att_ids or []:
+        try:
+            info = upload_handler.resolve_upload(att_id, owner=owner)
+        except Exception as e:
+            logger.warning("Failed to resolve image edit upload %s", att_id, exc_info=e)
+            continue
+        if not info:
+            continue
+        name = info.get("name") or info.get("original_name") or info.get("id") or ""
+        mime = info.get("mime", "")
+        try:
+            if upload_handler.is_image_file(name, mime):
+                return info
+        except Exception:
+            continue
+    return None
 
 
 def _recover_empty_session_model(sess, session_id: str, owner: str | None = None) -> bool:
@@ -602,9 +875,85 @@ def _recover_empty_session_model(sess, session_id: str, owner: str | None = None
     except Exception as e:
         db.rollback()
         logger.warning("Failed to recover empty session model for %s: %s", session_id, e)
+    return False
+
+
+def _reconcile_selected_route_from_request(
+    request: Request,
+    sess,
+    session_id: str,
+    form_data,
+    owner: str | None = None,
+) -> bool:
+    """Apply the model route the browser selected before streaming.
+
+    The frontend creates a pending chat first and only materializes it on first
+    send. Startup/default-model refreshes can race with that UI state, so the
+    stream request includes the route that was selected at click/send time.
+    Trust only registered endpoint ids, or the session's existing endpoint URL.
+    """
+    selected_model = str(form_data.get("selected_model") or "").strip()
+    selected_endpoint_id = str(form_data.get("selected_endpoint_id") or "").strip()
+    selected_endpoint_url = str(form_data.get("selected_endpoint_url") or "").strip()
+    if not selected_model:
         return False
+
+    endpoint_url = ""
+    headers = None
+    if selected_endpoint_id or selected_endpoint_url:
+        try:
+            from src.auth_helpers import owner_filter
+            from src.endpoint_resolver import build_headers, normalize_base
+            db = SessionLocal()
+            try:
+                q = db.query(ModelEndpoint).filter(ModelEndpoint.is_enabled == True)
+                if selected_endpoint_id:
+                    q = q.filter(ModelEndpoint.id == selected_endpoint_id)
+                if owner:
+                    q = owner_filter(q, ModelEndpoint, owner)
+                candidates = q.all() if selected_endpoint_url and not selected_endpoint_id else [q.first()]
+                ep = None
+                for cand in candidates:
+                    if not cand:
+                        continue
+                    if selected_endpoint_id or _session_url_matches_endpoint(selected_endpoint_url, cand.base_url or ""):
+                        ep = cand
+                        break
+                if not ep:
+                    return False
+                endpoint_url = build_chat_url(normalize_base(ep.base_url or ""))
+                headers = build_headers(ep.api_key or "", ep.base_url or "") if ep.api_key else {}
+            finally:
+                db.close()
+        except Exception as e:
+            logger.warning("Failed to resolve selected endpoint %s/%s for %s: %s", selected_endpoint_id, selected_endpoint_url, session_id, e)
+            return False
+
+    if not endpoint_url:
+        return False
+
+    if (
+        selected_model == (getattr(sess, "model", "") or "")
+        and endpoint_url == (getattr(sess, "endpoint_url", "") or "")
+    ):
+        return False
+
+    sess.model = selected_model
+    sess.endpoint_url = endpoint_url
+    sess.headers = headers or {}
+    db = SessionLocal()
+    try:
+        db_session = db.query(DBSession).filter(DBSession.id == session_id).first()
+        if db_session:
+            db_session.model = selected_model
+            db_session.endpoint_url = endpoint_url
+            db_session.headers = sess.headers or {}
+            db_session.updated_at = datetime.utcnow()
+            db.commit()
     finally:
         db.close()
+    logger.info("Reconciled selected route for %s: model=%r endpoint=%s", session_id, selected_model, redact_url(endpoint_url))
+    return True
 
 
 def _set_user_time_from_request(request: Request) -> None:

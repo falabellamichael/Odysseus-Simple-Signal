@@ -165,8 +165,9 @@ def test_chatgpt_subscription_clears_previously_persisted_bearer(monkeypatch):
         db.close()
 
 
-def test_chatgpt_subscription_fallback_auth_is_not_written_to_sessions_table(monkeypatch):
-    """Fallback endpoint selection must keep the resolved bearer request-local."""
+def test_chatgpt_subscription_foreground_fallback_auth_is_not_written_to_sessions_table(monkeypatch):
+    """Explicit foreground candidates must keep subscription bearers request-local."""
+    import src.foreground_model_routing as foreground_routing
     TestSessionLocal = _mem_db(monkeypatch)
     db = TestSessionLocal()
     try:
@@ -193,20 +194,31 @@ def test_chatgpt_subscription_fallback_auth_is_not_written_to_sessions_table(mon
         id="sess1", endpoint_url="https://old.example/v1", model="old-model",
         owner="alice", headers={},
     )
-    result = chat_helpers.try_fallback_endpoint(sess, "sess1")
+    monkeypatch.setattr(endpoint_resolver, "SessionLocal", TestSessionLocal)
+    monkeypatch.setattr(
+        foreground_routing,
+        "_load_policy_preferences",
+        lambda owner: {
+            "foreground_fallback_enabled": True,
+            "foreground_model_fallbacks": [{"endpoint_id": "ep1", "model": "gpt-5.1-codex"}],
+        },
+    )
+    policy = foreground_routing.resolve_foreground_model_policy(owner="alice")
+    candidates = foreground_routing.build_foreground_model_candidates(
+        sess.endpoint_url, sess.model, sess.headers, owner="alice", policy=policy,
+    )
 
-    assert result == {
-        "model": "gpt-5.1-codex",
-        "endpoint_url": _CODEX_BASE + "/responses",
-        "endpoint_name": "Codex Subscription",
-    }
-    assert sess.headers["Authorization"] == "Bearer live-access-token"
+    assert len(candidates) == 2
+    assert candidates[0] == ("https://old.example/v1", "old-model", {})
+    assert candidates[1][:2] == (_CODEX_BASE + "/responses", "gpt-5.1-codex")
+    assert candidates[1][2]["Authorization"] == "Bearer live-access-token"
+    assert sess.headers == {}
 
     db = TestSessionLocal()
     try:
         row = db.query(DbSession).filter(DbSession.id == "sess1").first()
-        assert row.model == "gpt-5.1-codex"
-        assert row.endpoint_url == _CODEX_BASE + "/responses"
+        assert row.model == "old-model"
+        assert row.endpoint_url == "https://old.example/v1"
         stored = row.headers or {}
         assert not any(k.lower() == "authorization" for k in stored), (
             f"Codex fallback bearer leaked into sessions table: {stored}"

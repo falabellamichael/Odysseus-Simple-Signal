@@ -33,6 +33,8 @@ _read_accounts_from_db = _email._read_accounts_from_db
 _read_email = _email._read_email
 _read_email_across_accounts = _email._read_email_across_accounts
 _reply_to_email = _email._reply_to_email
+_scan_unsubscribe_candidates = _email._scan_unsubscribe_candidates
+_unsubscribe_email = _email._unsubscribe_email
 _search_emails = _email._search_emails
 _search_uids = _email._search_uids
 _send_email = _email._send_email
@@ -96,6 +98,45 @@ async def list_tools() -> list[Tool]:
                     **ACCOUNT_PROP,
                 },
                 "required": [],
+            },
+        ),
+        Tool(
+            name="scan_email_unsubscribes",
+            description=(
+                "Scan recent email headers for likely spam/newsletter unsubscribe candidates. "
+                "Returns reviewable candidates with UID, sender, subject, score, reasons, and "
+                "List-Unsubscribe methods. This does not unsubscribe anything. For mailto "
+                "methods, use unsubscribe_email after user approval. For web URL methods, use "
+                "browser/web tools after user approval to open the exact URL and complete the page."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "folder": {"type": "string", "description": "IMAP folder to scan", "default": "INBOX"},
+                    "limit": {"type": "integer", "description": "Maximum candidates to return", "default": 25},
+                    "max_scan": {"type": "integer", "description": "How many newest messages to inspect", "default": 150},
+                    **ACCOUNT_PROP,
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="unsubscribe_email",
+            description=(
+                "Execute one approved unsubscribe action for an email UID. Supports safe mailto "
+                "List-Unsubscribe directly. If the selected method is a web URL, this returns "
+                "requires_browser with the exact URL; use browser/web tools only after user approval."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "uid": {"type": "string", "description": "Email UID from scan_email_unsubscribes/list_emails"},
+                    "folder": {"type": "string", "description": "IMAP folder", "default": "INBOX"},
+                    "method_index": {"type": "integer", "description": "Unsubscribe method index from scan_email_unsubscribes", "default": 0},
+                    "allow_web": {"type": "boolean", "description": "Return web unsubscribe URL instructions when the method is URL", "default": False},
+                    **ACCOUNT_PROP,
+                },
+                "required": ["uid"],
             },
         ),
         Tool(
@@ -471,6 +512,69 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     line += f"\n   Summary: {em['summary']}"
                 lines.append(line)
             return [TextContent(type="text", text="\n\n".join(lines))]
+
+        elif name == "scan_email_unsubscribes":
+            try:
+                result = _scan_unsubscribe_candidates(
+                    folder=arguments.get("folder", "INBOX"),
+                    account=acct,
+                    limit=arguments.get("limit", 25),
+                    max_scan=arguments.get("max_scan", 150),
+                )
+            except Exception as e:
+                return [TextContent(type="text", text=f"Unsubscribe scan failed: {e}")]
+            if not result.get("success"):
+                return [TextContent(type="text", text=f"Unsubscribe scan failed: {result.get('error', 'unknown error')}")]
+            candidates = result.get("candidates") or []
+            if not candidates:
+                return [TextContent(type="text", text=f"No unsubscribe candidates found in {result.get('scanned', 0)} recent emails.")]
+            lines = [
+                f"Found {len(candidates)} unsubscribe candidate(s) from {result.get('scanned', 0)} recent emails.",
+                "Review these with the user before executing. Mailto methods can use unsubscribe_email; URL methods require browser/web tools after approval.\n",
+            ]
+            for i, cand in enumerate(candidates, 1):
+                lines.append(
+                    f"{i}. **{cand.get('subject') or '(no subject)'}**\n"
+                    f"   From: {cand.get('from_name') or cand.get('from_address') or ''} ({cand.get('from_address') or ''})\n"
+                    f"   UID: {cand.get('uid')}  Folder: {cand.get('folder')}\n"
+                    f"   Score: {cand.get('score')}  Matching emails: {cand.get('duplicate_count', 1)}  Reasons: {', '.join(cand.get('reasons') or [])}"
+                )
+                for j, method in enumerate(cand.get("methods") or []):
+                    if method.get("kind") == "mailto":
+                        lines.append(f"   Method {j}: mailto {method.get('target')} (executable via unsubscribe_email)")
+                    elif method.get("kind") == "url":
+                        lines.append(f"   Method {j}: web URL {method.get('target')} (use browser/web tools after approval)")
+            return [TextContent(type="text", text="\n".join(lines))]
+
+        elif name == "unsubscribe_email":
+            result = _unsubscribe_email(
+                uid=arguments.get("uid"),
+                folder=arguments.get("folder", "INBOX"),
+                account=acct,
+                method_index=arguments.get("method_index", 0),
+                allow_web=bool(arguments.get("allow_web", False)),
+            )
+            if result.get("requires_browser"):
+                return [TextContent(
+                    type="text",
+                    text=(
+                        "Web unsubscribe requires browser/web navigation.\n"
+                        f"URL: {result.get('url')}\n"
+                        f"{result.get('instructions')}"
+                    ),
+                )]
+            if not result.get("success"):
+                return [TextContent(type="text", text=f"Unsubscribe failed: {result.get('error', 'unknown error')}")]
+            method = result.get("method") or {}
+            if result.get("pending"):
+                return [TextContent(
+                    type="text",
+                    text=(
+                        f"Unsubscribe email staged for approval to {method.get('target')}. "
+                        "Nothing has been sent until the user approves the pending email."
+                    ),
+                )]
+            return [TextContent(type="text", text=f"Unsubscribe email sent to {method.get('target')}.")]
 
         elif name == "download_attachment":
             uid = arguments.get("uid")

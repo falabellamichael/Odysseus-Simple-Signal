@@ -1406,11 +1406,11 @@ body.fullwidth-chat .chat-history {
 .agent-thread:not(.has-bottom) .agent-thread-node.open:last-child::after {
   content: '';
   position: absolute;
-  /* -17px (was -15) nudges the terminating dot 2px further left so it
-     sits flush with the thread's left rail when the search node is
-     expanded. This is the "big glow dot at the bottom" the user sees
-     after a web_search step. */
-  left: -17px;
+  /* Centre the 6px dot on the rail: the rail sits at left:5px + 2px wide,
+     so its centre is 6px from the thread's left edge and the dot's left
+     edge belongs at 3px — i.e. 3px - padding-left. Keep this in step with
+     .agent-thread-dot and with the mobile padding override below. */
+  left: -19px;
   bottom: 5px;
   width: 6px;
   height: 6px;
@@ -1624,6 +1624,33 @@ body.fullwidth-chat .chat-history {
   overflow-x: auto;
 }
 
+.agent-image-progress {
+  margin: 6px 0 0;
+}
+.agent-image-progress-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 11px;
+  line-height: 1.2;
+  color: color-mix(in srgb, var(--fg) 72%, transparent);
+}
+.agent-image-progress-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agent-image-progress-value {
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+  color: color-mix(in srgb, var(--accent, var(--red)) 75%, var(--fg));
+}
+.agent-image-progress-track {
+  display: none !important;
+}
+
 /* Mobile: constrain thread content */
 @media (max-width: 768px) {
   .agent-thread {
@@ -1651,6 +1678,11 @@ body.fullwidth-chat .chat-history {
   .agent-thread-dot {
     left: -16px;
     top: 10px;
+  }
+  /* padding-left drops to 18px here, so the terminating dot needs its own
+     offset (3px - 18px) to stay centred on the rail. */
+  .agent-thread:not(.has-bottom) .agent-thread-node.open:last-child::after {
+    left: -15px;
   }
 }
 
@@ -3178,7 +3210,8 @@ textarea.memory-add-input {
   padding-right: 18px;
 }
 #email-lib-bulk-delete.email-bulk-loading,
-#email-lib-bulk-actions.email-bulk-loading {
+#email-lib-bulk-actions.email-bulk-loading,
+#tasks-bulk-delete.tasks-bulk-loading {
   display: inline-flex;
   align-items: center;
   gap: 5px;
@@ -3186,7 +3219,8 @@ textarea.memory-add-input {
   cursor: wait;
 }
 #email-lib-bulk-delete.email-bulk-loading .email-bulk-whirlpool,
-#email-lib-bulk-actions.email-bulk-loading .email-bulk-whirlpool {
+#email-lib-bulk-actions.email-bulk-loading .email-bulk-whirlpool,
+#tasks-bulk-delete.tasks-bulk-loading .tasks-bulk-whirlpool {
   width: 12px;
   height: 12px;
   margin: 0;
@@ -3194,9 +3228,10 @@ textarea.memory-add-input {
   top: -1px;
 }
 #email-lib-bulk-delete.email-bulk-loading .email-bulk-loading-label,
-#email-lib-bulk-actions.email-bulk-loading .email-bulk-loading-label {
+#email-lib-bulk-actions.email-bulk-loading .email-bulk-loading-label,
+#tasks-bulk-delete.tasks-bulk-loading .tasks-bulk-loading-label {
   position: relative;
-  top: -2px;
+  top: 0;
 }
 /* Drafts bulk bar defaults to justify-content:flex-end (whole row hugs the
    right). Reset it so All + count sit on the left and only the action button

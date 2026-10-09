@@ -47,6 +47,7 @@ async def action_consolidate_memory(owner: str, **kwargs) -> Tuple[str, bool]:
     try:
         import json
         import re
+        from difflib import SequenceMatcher
         from src.constants import DATA_DIR
         from src.llm_core import llm_call_async_with_fallback
         from src.memory import MemoryManager
@@ -81,6 +82,64 @@ async def action_consolidate_memory(owner: str, **kwargs) -> Tuple[str, bool]:
         removed_examples = []
         ai_reasons = []
         ai_used = False
+
+        def _normalized_memory_text(mem: dict) -> str:
+            text = (mem.get("text") or "").lower()
+            text = re.sub(r"[^a-z0-9@._+-]+", " ", text)
+            return " ".join(text.split())
+
+        def _memory_rank(mem: dict) -> tuple:
+            text = (mem.get("text") or "").strip()
+            return (
+                1 if mem.get("pinned") else 0,
+                1 if (mem.get("source") or "") == "user" else 0,
+                int(mem.get("uses") or 0),
+                -len(text),
+                int(mem.get("timestamp") or 0),
+            )
+
+        def _same_memory_fact(a: dict, b: dict) -> bool:
+            a_cat = (a.get("category") or "fact").strip().lower()
+            b_cat = (b.get("category") or "fact").strip().lower()
+            if a_cat != b_cat:
+                return False
+            a_text = _normalized_memory_text(a)
+            b_text = _normalized_memory_text(b)
+            if not a_text or not b_text:
+                return False
+            if a_text == b_text:
+                return True
+            shorter, longer = sorted((a_text, b_text), key=len)
+            if len(shorter) >= 24 and shorter in longer:
+                return True
+            return SequenceMatcher(None, a_text, b_text).ratio() >= 0.88
+
+        def _dedupe_group(group_memories: list) -> tuple[list, int]:
+            kept = []
+            removed = 0
+            for mem in group_memories:
+                text = (mem.get("text") or "").strip()
+                if not text:
+                    removed += 1
+                    if len(removed_examples) < 3:
+                        removed_examples.append("(empty)")
+                    continue
+                duplicate_idx = next(
+                    (idx for idx, kept_mem in enumerate(kept) if _same_memory_fact(mem, kept_mem)),
+                    None,
+                )
+                if duplicate_idx is None:
+                    kept.append(mem)
+                    continue
+                removed += 1
+                if _memory_rank(mem) > _memory_rank(kept[duplicate_idx]):
+                    if len(removed_examples) < 3:
+                        old_text = (kept[duplicate_idx].get("text") or "").strip()
+                        removed_examples.append(old_text[:60] + ("..." if len(old_text) > 60 else ""))
+                    kept[duplicate_idx] = mem
+                elif len(removed_examples) < 3:
+                    removed_examples.append(text[:60] + ("..." if len(text) > 60 else ""))
+            return kept, removed
 
         async def _try_ai_tidy_group(group_owner: str, group_memories: list) -> bool:
             nonlocal all_memories, total_removed, total_cleaned, total_scanned, ai_used
@@ -190,7 +249,6 @@ async def action_consolidate_memory(owner: str, **kwargs) -> Tuple[str, bool]:
                                 kept_all.append(mem)
 
                             removed = sum(1 for m in group_memories if m.get("id") in drop_ids)
-                            total_scanned += len(group_memories)
                             if removed or changed_text:
                                 all_memories = kept_all
                                 total_removed += removed
@@ -207,12 +265,23 @@ async def action_consolidate_memory(owner: str, **kwargs) -> Tuple[str, bool]:
             return False
 
         for group_owner, group_memories in memory_groups.items():
+            total_scanned += len(group_memories)
+            deduped_group, group_removed = _dedupe_group(group_memories)
+            if group_removed:
+                group_ref_ids = {id(m) for m in group_memories}
+                keep_ref_ids = {id(m) for m in deduped_group}
+                all_memories = [
+                    m for m in all_memories
+                    if id(m) not in group_ref_ids or id(m) in keep_ref_ids
+                ]
+                total_removed += group_removed
+                group_memories = deduped_group
+
             if await _try_ai_tidy_group(group_owner, group_memories):
                 continue
 
             seen = {}
             keep_refs = set()
-            total_scanned += len(group_memories)
             for mem in group_memories:
                 text = (mem.get("text") or "").strip()
                 key = " ".join(text.lower().split())
@@ -267,13 +336,27 @@ async def action_tidy_research(owner: str, **kwargs) -> Tuple[str, bool]:
 
     Research history lives entirely in data/deep_research/<id>.json and is NOT
     backed by chat-session rows — so a file must never be deleted just because
-    no chat session matches its id. Only prune files that fail to load."""
+    no chat session matches its id. Only prune files that fail to load.
+
+    A broken file has no readable owner stamp, so it cannot be matched against
+    `owner`. Clearing one is privileged: admins and the single-user operator
+    (AUTH_ENABLED=false) may, a regular user may not, and neither may anyone
+    during the pre-setup window before an admin exists.
+    """
     try:
         from pathlib import Path
         import json as _json
+        from src.tool_security import owner_is_admin_or_single_user
         research_dir = Path(DEEP_RESEARCH_DIR)
         if not research_dir.exists():
             raise TaskNoop("no research directory")
+        if not owner_is_admin_or_single_user(owner):
+            # Return before the glob rather than filtering inside the loop: the
+            # loop reports "none broken" off an empty `removed`, which reaches
+            # Activity as a false report to a user whose files it skipped, and a
+            # regular user need not read every owner's file to learn it may
+            # delete none of them.
+            raise TaskNoop("not permitted to remove unattributable research files")
         files = list(research_dir.glob("*.json"))
         removed = []
         for p in files:

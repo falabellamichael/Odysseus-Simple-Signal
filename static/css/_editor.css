@@ -3173,12 +3173,8 @@ span[id$="-logo"] svg:not([width]) {
   background: linear-gradient(to top, transparent 0 3px, color-mix(in srgb, var(--accent, var(--red)) 35%, transparent) 3px 7px, transparent 7px 10px) !important;
 }
 
-[data-settings-panel="ai"] .admin-card > h2 > svg,
-[data-settings-panel="services"] .admin-card > h2 > svg,
-[data-settings-panel="added-models"] .admin-card > h2 > svg,
-[data-settings-panel="search"] .admin-card > h2 > svg,
-[data-settings-panel="integrations"] .admin-card > h2 > svg,
-[data-settings-panel="reminders"] .admin-card > h2 > svg,
+[data-settings-panel] .admin-card > h2 > svg,
+#theme-popup .admin-card > h2 > svg,
 [data-settings-panel="added-models"] .adm-ep-section-head > svg {
   color: var(--accent, var(--red));
 }

@@ -50,7 +50,7 @@ from routes.cookbook_helpers import (
     _SESSION_ID_RE, _validate_repo_id, _validate_serve_model_id, _validate_include, _validate_token,
     _validate_local_dir, _validate_gpus, _shell_path,
     _ps_squote, _bash_squote, _validate_serve_cmd, _parse_serve_phase, OLLAMA_MISSING_HINT,
-    _safe_env_prefix, _local_tooling_path_export, _append_serve_preflight_exit_lines,
+    _safe_env_prefix, _local_windows_bash_env_prefix, _local_tooling_path_export, _append_serve_preflight_exit_lines,
     _append_serve_exit_code_lines, _append_llama_cpp_linux_accel_build_lines, _cached_model_scan_script,
     load_stored_hf_token,
     _append_vllm_linux_preflight_lines, _ollama_bind_from_cmd, _pip_install_fallback_chain,
@@ -69,6 +69,47 @@ _HF_TOKEN_STATUS_SNIPPET = (
     'Add one in Odysseus Cookbook -> Settings -> HuggingFace Token."; '
     'fi'
 )
+
+
+def _windows_local_pid_record_line(pid_path: Path, ready_path: Path) -> str:
+    """Build the Git Bash prelude that records a Win32-stoppable PID.
+
+    Python publishes the detached outer process's Win32 PID first, then touches
+    ``ready_path``. The inner Git Bash runner waits for that publication before
+    replacing the fallback with its own Win32 PID from /proc/<msys-pid>/winpid.
+
+    Missing, malformed, or late mappings leave the valid outer PID untouched.
+    """
+    pp = shlex.quote(pid_path.as_posix())
+    rp = shlex.quote(ready_path.as_posix())
+    return (
+        "i=0; "
+        f"while [ ! -e {rp} ] && [ \"$i\" -lt 500 ]; do "
+        "i=$((i+1)); sleep 0.01; done; "
+        f"if [ -e {rp} ]; then "
+        "winpid=\"$(cat /proc/$$/winpid 2>/dev/null || true)\"; "
+        "case \"$winpid\" in ''|*[!0-9]*) ;; "
+        f"*) printf '%s\\n' \"$winpid\" > {pp} ;; esac; "
+        "fi; "
+        f"rm -f {rp}"
+    )
+
+
+def _append_mlx_image_server_script(runner_lines: list[str]) -> None:
+    """Write the MLX image API helper next to the tmux runner on remote hosts."""
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "mlx_image_server.py"
+    try:
+        script = script_path.read_text(encoding="utf-8")
+    except Exception as e:
+        logger.warning("Failed to read mlx_image_server.py: %s", e)
+        runner_lines.append('echo "ERROR: Odysseus could not prepare the MLX image server helper."')
+        runner_lines.append('ODYSSEUS_PREFLIGHT_EXIT=127')
+        return
+    runner_lines.append('mkdir -p scripts')
+    runner_lines.append("cat > scripts/mlx_image_server.py <<'PY'")
+    runner_lines.extend(script.splitlines())
+    runner_lines.append("PY")
+    runner_lines.append('chmod +x scripts/mlx_image_server.py 2>/dev/null || true')
 
 
 def _venv_root_from_serve_cmd(cmd: str) -> str:

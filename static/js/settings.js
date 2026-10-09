@@ -3,19 +3,61 @@
 
 import uiModule from './ui.js';
 import searchModule from './search.js';
-import { makeWindowDraggable } from './windowDrag.js';
-import { clearDockSide } from './modalSnap.js';
+import { byId } from './settings/dom.js';
+import {
+  getSettingsRegistryIssues,
+  isAdminManagedSettingsTab,
+} from './settings/registry.js';
+import { bindSettingsSearch } from './settings/search.js';
+import { bindSettingsSidebar } from './settings/sidebar.js';
+import {
+  activateSettingsPanel,
+  getActiveSettingsTab,
+  bindSettingsNavigation,
+} from './settings/navigation.js';
+import {
+  bindSettingsDrag,
+  bindSettingsClose,
+  bindOpenPromptModalLink,
+  showSettingsModal,
+  hideSettingsModal,
+} from './settings/lifecycle.js';
 import { sortModelIds } from './modelSort.js';
 import { providerLogo } from './providers.js';
 import { isAltGrEvent } from './platform.js';
 import { bindMenuDismiss } from './escMenuStack.js';
+import { invalidateSettings } from './appConfig.js';
 
 let initialized = false;
 let modalEl = null;
 let _authPolicy = { password_min_length: 8 };
-let _closeGen = 0;
 
-function el(id) { return document.getElementById(id); }
+/**
+ * POST a settings patch, then drop the shared snapshot in appConfig.js.
+ *
+ * Every write in this file goes through here so no save path can forget the
+ * invalidation — a stale settings object served for the rest of the session is
+ * a worse bug than the duplicate fetches the cache removes. The invalidation is
+ * in a `finally` because a request that throws on the way back may still have
+ * been applied server-side.
+ *
+ * Reads in this file deliberately stay direct fetches: this panel is the writer
+ * and edits what it reads, so it must see the authoritative state, not a cache.
+ */
+async function _postSettings(body) {
+  try {
+    return await fetch('/api/auth/settings', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  } finally {
+    invalidateSettings();
+  }
+}
+
+const el = byId;
 function esc(s) { return uiModule.esc(s); }
 function isMobileStandaloneEmailUnsupported(d) {
   return !!(d && (d.mobile_standalone_unsupported || d.standalone_unsupported));
@@ -28,132 +70,22 @@ function safeRasterDataUrl(raw) {
   return /^data:image\/(?:png|jpe?g|gif|webp);base64,[a-z0-9+/=\s]+$/i.test(value) ? value : '';
 }
 
-/* ── Tab switching ── */
-const ADMIN_TABS = new Set(['services', 'integrations', 'tools', 'users', 'system']);
+/* ── Settings shell coordination ── */
+function onSettingsPanelActivated(tab) {
+  // Appearance keeps its existing transparent preview behavior.
+  document.body.classList.toggle('settings-appearance-open', tab === 'appearance');
+  syncAppearanceOpacity(tab === 'appearance');
 
-function initTabs() {
-  modalEl.querySelectorAll('[data-settings-tab]').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const tab = btn.dataset.settingsTab;
-      // Lazy-init admin when first clicking an admin tab
-      if (ADMIN_TABS.has(tab) && window.adminModule && typeof window.adminModule.open === 'function') {
-        window.adminModule.open(tab);
-        return;
-      }
-      modalEl.querySelectorAll('[data-settings-tab]').forEach(b => b.classList.toggle('active', b.dataset.settingsTab === tab));
-      modalEl.querySelectorAll('[data-settings-panel]').forEach(p => p.classList.toggle('hidden', p.dataset.settingsPanel !== tab));
-      // Mark when the Appearance tab is open so the modal can go
-      // semi-transparent — lets the user see the rest of the UI react as
-      // they flip toggles instead of having to close + reopen the modal.
-      document.body.classList.toggle('settings-appearance-open', tab === 'appearance');
-      syncAppearanceOpacity(tab === 'appearance');
-      if (tab === 'ai') refreshAiModelEndpoints();
-    });
-  });
+  // AI endpoints are intentionally refreshed only when entering the AI panel.
+  if (tab === 'ai') refreshAiModelEndpoints();
 }
 
-/* ── Dragging ── */
-function initDrag() {
-  const header = modalEl.querySelector('.modal-header');
-  const content = modalEl.querySelector('.settings-modal-content');
-  if (!header || !content) return;
-  // Skip interactive controls in the header (e.g. the opacity slider) so
-  // grabbing them doesn't start a window-drag.
-  makeWindowDraggable(modalEl, {
-    content,
-    header,
-    skipSelector: 'button, input, select, .theme-opacity-wrap',
-    enableDock: true,
-  });
-}
-
-function resetWindowPlacement() {
-  const content = modalEl && modalEl.querySelector('.settings-modal-content');
-  if (!content) return;
-  const dockSides = ['left', 'right', 'top', 'bottom'];
-  const activeDockSides = dockSides.filter((side) => modalEl.classList.contains(`modal-${side}-docked`));
-  modalEl.classList.remove(...dockSides.map((side) => `modal-${side}-docked`), 'modal-full-expanded');
-  activeDockSides.forEach((side) => clearDockSide(side, modalEl));
-  if (content._leftDockNavObs) {
-    try { content._leftDockNavObs.navObs && content._leftDockNavObs.navObs.disconnect(); } catch (_) {}
-    try { window.removeEventListener('resize', content._leftDockNavObs.reanchor); } catch (_) {}
-    delete content._leftDockNavObs;
+function openAdminSettingsTab(tab) {
+  if (window.adminModule && typeof window.adminModule.open === 'function') {
+    window.adminModule.open(tab);
+    return true;
   }
-  delete content._preDockSnapshot;
-  delete content._dockSide;
-  delete content._dockSuspended;
-  delete content._fullExpandReturnState;
-  delete content.dataset._tilePreSnap;
-  delete content.dataset._tileZone;
-  [
-    'position', 'left', 'top', 'right', 'bottom', 'margin', 'transform',
-    'width', 'height', 'min-height', 'max-width', 'max-height', 'border-radius', 'transition',
-  ].forEach(prop => content.style.removeProperty(prop));
-  const expandBtn = modalEl.querySelector('.modal-expand-btn');
-  if (expandBtn) {
-    expandBtn.classList.remove('active');
-    expandBtn.setAttribute('aria-pressed', 'false');
-    expandBtn.title = 'Full expand window';
-  }
-}
-
-/* ── Delegated link: close Settings + open the Prompt (characters) modal ── */
-function initOpenPromptModalLink() {
-  document.addEventListener('click', async (e) => {
-    const link = e.target.closest('[data-open-prompt-modal]');
-    if (!link) return;
-    e.preventDefault();
-    // Close settings first so the prompt modal isn't stacked on top.
-    if (modalEl && !modalEl.classList.contains('hidden')) close();
-    try {
-      const m = await import('./presets.js');
-      const fn = m.openCustomPresetModal || (m.default && m.default.openCustomPresetModal);
-      if (typeof fn === 'function') fn();
-    } catch (_) {
-      const modal = document.getElementById('custom-preset-modal');
-      if (modal) modal.classList.remove('hidden');
-    }
-    // Force the Persona tab (data-chartab="character") since the link's
-    // whole purpose is editing personas — not landing on Inject by default.
-    const personaTab = document.querySelector('#custom-preset-modal .preset-tab[data-chartab="character"]');
-    if (personaTab) personaTab.click();
-  });
-}
-
-/* ── Close on backdrop / X ── */
-function initClose() {
-  modalEl.querySelector('.close-btn').addEventListener('click', close);
-  modalEl.addEventListener('mousedown', e => {
-    if (uiModule.isTouchInsideModal()) return;
-    if (e.target === modalEl) close();
-  });
-  document.addEventListener('keydown', e => {
-    if (e.key !== 'Escape' || !modalEl || modalEl.classList.contains('hidden')) return;
-    // Bail when a transient popover inside the modal is open — Esc should
-    // dismiss just that, not the whole modal. Same-document listeners fire
-    // in registration order regardless of capture/bubble, so the popover's
-    // own handler can't pre-empt ours; we have to opt out here.
-    const popoverOpen = modalEl.querySelector(
-      '#adm-epLocalMoreMenu, #adm-epApiMoreMenu, #adm-provider-menu, #search-provider-menu, [data-popover-open="1"]'
-    );
-    if (popoverOpen && popoverOpen.style.display !== 'none' && !popoverOpen.classList.contains('hidden')) {
-      return;
-    }
-    // If an integration edit/add form is open inside the modal, close
-    // just that — don't dismiss the whole settings modal. (Pressing
-    // ESC mid-edit and losing the modal was a fast-typing footgun.)
-    const innerForm = modalEl.querySelector('#unified-intg-form, #set-email-accounts-form');
-    if (innerForm && innerForm.style.display !== 'none' && innerForm.children.length > 0) {
-      e.preventDefault();
-      e.stopPropagation();
-      innerForm.style.display = 'none';
-      innerForm.innerHTML = '';
-      return;
-    }
-    e.preventDefault();
-    e.stopPropagation();
-    close();
-  });
+  return false;
 }
 
 /* ── Appearance-tab opacity slider ──
@@ -376,10 +308,7 @@ function _bindFallbackWidget(opts) {
     var body = {};
     body[settingKey] = clean;
     try {
-      await fetch('/api/auth/settings', { method: 'POST', credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-      });
+      await _postSettings(body);
     } catch (e) { console.warn('[fallback] save failed for ' + settingKey, e); }
   }
 
@@ -458,14 +387,7 @@ async function initDefaultChat() {
   var epSel = el('set-defaultEpSelect');
   var modelSel = el('set-defaultModelSelect');
   var msg = el('set-defaultChatMsg');
-  var fbContainer = el('set-defaultFallbacks');
-  var addFbBtn = el('set-defaultAddFallback');
   var _endpoints = [];
-  var _fallbacks = []; // [{endpoint_id, model}] — tried in order if primary fails
-
-  function enabledEndpoints() {
-    return _endpoints.filter(function(e) { return e.is_enabled; });
-  }
 
   // Fill any <select> with the models for a given endpoint id.
   function fillModels(selectEl, epId, selected) {
@@ -482,64 +404,6 @@ async function initDefaultChat() {
   function refreshEndpointOptions(selectedEndpoint, selectedModel) {
     _fillEndpointSelect(epSel, _endpoints, selectedEndpoint !== undefined ? selectedEndpoint : epSel.value, false);
     refreshModels(selectedModel !== undefined ? selectedModel : modelSel.value);
-    renderFallbacks();
-  }
-
-  // Render the fallback chain. Each row is endpoint + model + remove.
-  function renderFallbacks() {
-    fbContainer.innerHTML = '';
-    _fallbacks.forEach(function(fb, idx) {
-      var row = document.createElement('div');
-      row.className = 'settings-fallback-row';
-
-      var num = document.createElement('span');
-      num.className = 'settings-fallback-num';
-      num.textContent = (idx + 1) + '.';
-
-      var epS = document.createElement('select');
-      epS.className = 'settings-select';
-      enabledEndpoints().forEach(function(ep) {
-        var o = document.createElement('option');
-        o.value = ep.id;
-        o.textContent = ep.name + (ep.online ? '' : ' (offline)');
-        epS.appendChild(o);
-      });
-      var first = enabledEndpoints()[0];
-      epS.value = fb.endpoint_id || (first ? first.id : '');
-
-      var mS = document.createElement('select');
-      mS.className = 'settings-select';
-      fillModels(mS, epS.value, fb.model);
-
-      // Keep the model in sync with the values actually shown.
-      fb.endpoint_id = epS.value;
-      fb.model = mS.value;
-
-      epS.addEventListener('change', function() {
-        fb.endpoint_id = epS.value;
-        fillModels(mS, epS.value, '');
-        fb.model = mS.value;
-        saveDefault();
-      });
-      mS.addEventListener('change', function() { fb.model = mS.value; saveDefault(); });
-
-      var rm = document.createElement('button');
-      rm.type = 'button';
-      rm.className = 'settings-fallback-remove';
-      rm.title = 'Remove fallback';
-      rm.innerHTML = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>';
-      rm.addEventListener('click', function() {
-        _fallbacks.splice(idx, 1);
-        renderFallbacks();
-        saveDefault();
-      });
-
-      row.appendChild(num);
-      row.appendChild(epS);
-      row.appendChild(mS);
-      row.appendChild(rm);
-      fbContainer.appendChild(row);
-    });
   }
 
   try {
@@ -547,12 +411,6 @@ async function initDefaultChat() {
     var settings = await res.json();
     if (settings.default_endpoint_id) epSel.value = settings.default_endpoint_id;
     refreshModels(settings.default_model || '');
-    _fallbacks = Array.isArray(settings.default_model_fallbacks)
-      ? settings.default_model_fallbacks.map(function(f) {
-          return { endpoint_id: (f && f.endpoint_id) || '', model: (f && f.model) || '' };
-        })
-      : [];
-    renderFallbacks();
   } catch (e) { console.warn('Failed to load default chat settings', e); }
 
   epSel.addEventListener('change', function() { refreshModels(''); saveDefault(); });
@@ -560,26 +418,14 @@ async function initDefaultChat() {
 
   async function saveDefault() {
     try {
-      var clean = _fallbacks.filter(function(f) { return f.endpoint_id && f.model; });
-      await fetch('/api/auth/settings', { method: 'POST', credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          default_endpoint_id: epSel.value,
-          default_model: modelSel.value,
-          default_model_fallbacks: clean
-        })
+      await _postSettings({
+        default_endpoint_id: epSel.value,
+        default_model: modelSel.value
       });
       msg.textContent = 'Saved'; msg.style.color = 'var(--fg)';
       setTimeout(function() { msg.textContent = ''; }, 2000);
     } catch (e) { msg.textContent = 'Failed to save'; msg.style.color = 'var(--red)'; }
   }
-
-  if (addFbBtn) addFbBtn.addEventListener('click', function() {
-    var first = enabledEndpoints()[0];
-    _fallbacks.push({ endpoint_id: first ? first.id : '', model: '' });
-    renderFallbacks();
-    saveDefault();
-  });
 
   _registerAiEndpointRefresh(function(endpoints) {
     _endpoints = endpoints;
@@ -629,12 +475,9 @@ async function initUtilityModel() {
   // no toggle, "—" means "unset, use chat").
   async function saveUtility() {
     try {
-      await fetch('/api/auth/settings', { method: 'POST', credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          utility_endpoint_id: epSel.value || '',
-          utility_model: modelSel.value || ''
-        })
+      await _postSettings({
+        utility_endpoint_id: epSel.value || '',
+        utility_model: modelSel.value || ''
       });
       msg.textContent = 'Saved'; msg.style.color = 'var(--fg)';
       setTimeout(function() { msg.textContent = ''; }, 1500);
@@ -727,10 +570,7 @@ async function initTeacherModel() {
         spec = ep ? (modelSel.value + '@' + ep.name) : modelSel.value;
       }
       var enabled = enabledToggle ? !!enabledToggle.checked : false;
-      await fetch('/api/auth/settings', { method: 'POST', credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ teacher_enabled: enabled, teacher_model: spec })
-      });
+      await _postSettings({ teacher_enabled: enabled, teacher_model: spec });
       msg.textContent = enabled ? (spec ? 'Saved' : 'Pick an endpoint + model') : 'Disabled';
       msg.style.color = enabled && !spec ? 'var(--red)' : 'var(--fg)';
       setTimeout(function() { msg.textContent = ''; }, 2000);
@@ -805,8 +645,8 @@ async function initImageSettings() {
 
   async function saveSettings() {
     try {
-      await fetch('/api/auth/settings', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ image_gen_enabled: enabledToggle ? enabledToggle.checked : false, image_model: modelSel.value, image_quality: qualSel.value }) });
+      const res = await _postSettings({ image_gen_enabled: enabledToggle ? enabledToggle.checked : false, image_model: modelSel.value, image_quality: qualSel.value });
+      if (!res.ok) throw new Error(await res.text().catch(() => `HTTP ${res.status}`));
       msg.textContent = 'Saved'; msg.style.color = 'var(--fg)'; setTimeout(() => { msg.textContent = ''; }, 2000);
     } catch (e) { msg.textContent = 'Failed to save'; msg.style.color = 'var(--red)'; }
   }
@@ -879,8 +719,7 @@ async function initVisionSettings() {
 
   async function saveSettings() {
     try {
-      await fetch('/api/auth/settings', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ vision_enabled: enabledToggle ? enabledToggle.checked : true, vision_model: vlSel.value }) });
+      await _postSettings({ vision_enabled: enabledToggle ? enabledToggle.checked : true, vision_model: vlSel.value });
       msg.textContent = 'Saved'; msg.style.color = 'var(--fg)'; setTimeout(() => { msg.textContent = ''; }, 2000);
     } catch (e) { msg.textContent = 'Failed to save'; msg.style.color = 'var(--red)'; }
   }
@@ -961,8 +800,7 @@ async function initTtsSettings() {
 
   async function saveTTS() {
     try {
-      await fetch('/api/auth/settings', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tts_enabled: ttsEnabledToggle ? ttsEnabledToggle.checked : true, tts_provider: provSel.value, tts_model: getModel() || 'tts-1', tts_voice: getVoice() || 'alloy', tts_speed: speedSelect.value || '1' }) });
+      await _postSettings({ tts_enabled: ttsEnabledToggle ? ttsEnabledToggle.checked : true, tts_provider: provSel.value, tts_model: getModel() || 'tts-1', tts_voice: getVoice() || 'alloy', tts_speed: speedSelect.value || '1' });
       ttsMsg.textContent = 'Saved'; ttsMsg.style.color = 'var(--fg)'; setTimeout(() => { ttsMsg.textContent = ''; }, 2000);
       if (window.aiTTSManager) window.aiTTSManager.checkAvailability();
     } catch (e) { ttsMsg.textContent = 'Failed to save'; ttsMsg.style.color = 'var(--red)'; }
@@ -1123,9 +961,7 @@ async function initSttSettings() {
   async function saveSTT() {
     try {
       var enabled = sttEnabledToggle ? sttEnabledToggle.checked : false;
-      await fetch('/api/auth/settings', { method: 'POST', credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ stt_enabled: enabled, stt_provider: provSel.value, stt_model: getModel() || 'base', stt_language: langInput.value.trim() }) });
+      await _postSettings({ stt_enabled: enabled, stt_provider: provSel.value, stt_model: getModel() || 'base', stt_language: langInput.value.trim() });
       sttMsg.textContent = 'Saved'; sttMsg.style.color = 'var(--fg)'; setTimeout(() => { sttMsg.textContent = ''; }, 2000);
       // Notify voiceRecorder of effective provider and update send button icon
       if (window.voiceRecorderModule) window.voiceRecorderModule._sttProvider = effectiveProvider();
@@ -1281,10 +1117,7 @@ async function initSearchSettings() {
         payload[kf] = keyInput.value.trim();
         _settings[kf] = keyInput.value.trim();
       }
-      await fetch('/api/auth/settings', { method: 'POST', credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
+      await _postSettings(payload);
       msg.textContent = 'Saved'; msg.style.color = 'var(--fg)';
       setTimeout(refreshStatus, 2000);
       if (searchModule && searchModule.refresh) searchModule.refresh();
@@ -1436,11 +1269,7 @@ async function initSearchSettings() {
   async function _saveFallbackChain(chain) {
     _settings.search_fallback_chain = chain;
     try {
-      await fetch('/api/auth/settings', {
-        method: 'POST', credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ search_fallback_chain: chain }),
-      });
+      await _postSettings({ search_fallback_chain: chain });
       msg.textContent = 'Saved'; msg.style.color = 'var(--fg)';
       setTimeout(refreshStatus, 2000);
     } catch (e) { msg.textContent = 'Failed to save'; msg.style.color = 'var(--red)'; }
@@ -1604,10 +1433,7 @@ async function initResearchSettings() {
       }
     }
     try {
-      await fetch('/api/auth/settings', { method: 'POST', credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
+      await _postSettings(payload);
       msg.textContent = 'Saved'; msg.style.color = 'var(--fg)';
       setTimeout(showStatus, 2000);
     } catch (e) { msg.textContent = 'Failed to save'; msg.style.color = 'var(--red)'; }
@@ -1671,10 +1497,7 @@ async function initResearchSearchSettings() {
 
   async function saveResearchSearch() {
     try {
-      await fetch('/api/auth/settings', { method: 'POST', credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ research_search_provider: searchSel.value })
-      });
+      await _postSettings({ research_search_provider: searchSel.value });
       msg.textContent = 'Saved'; msg.style.color = 'var(--fg)';
       setTimeout(function() { msg.textContent = ''; }, 2000);
     } catch (e) { msg.textContent = 'Failed to save'; msg.style.color = 'var(--red)'; }
@@ -1716,10 +1539,7 @@ async function initAgentSettings() {
     if (rounds != null) payload.agent_max_rounds = rounds;
     if (supInput) payload.agent_supervisor_ladder = !!supInput.checked;
     try {
-      await fetch('/api/auth/settings', { method: 'POST', credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
+      await _postSettings(payload);
       msg.textContent = (tools > 0 ? 'Limit: ' + tools + ' tool calls' : 'Unlimited tool calls') +
         (rounds != null ? ' · ' + (rounds > 0 ? rounds + ' steps/message' : 'unlimited steps/message') : '') +
         (supInput && supInput.checked ? ' · supervisor on' : '');
@@ -1873,7 +1693,7 @@ const SHORTCUT_ICONS = {
   settings:       '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>',
   focus_input:    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
   open_calendar:  '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>',
-  open_compare:   '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="8" height="18" rx="1"/><rect x="14" y="3" width="8" height="18" rx="1"/></svg>',
+  open_compare:   '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="7" height="16" rx="1.5"/><rect x="14" y="4" width="7" height="16" rx="1.5"/><path d="M10 8h4"/><path d="M10 16h4"/></svg>',
   open_cookbook:  '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>',
   open_research:  '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg>',
   open_gallery:   '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>',
@@ -2114,11 +1934,7 @@ async function initShortcuts() {
 
   async function saveKeybinds() {
     try {
-      await fetch('/api/auth/settings', {
-        method: 'POST', credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ keybinds }),
-      });
+      await _postSettings({ keybinds });
       // Update global keybinds so they take effect immediately
       window._odysseusKeybinds = keybinds;
       if (uiModule && uiModule.showToast) uiModule.showToast('Shortcut saved');
@@ -2330,10 +2146,39 @@ function initAccount() {
 
 function initAll() {
   modalEl = el('settings-modal');
-  initTabs();
-  initDrag();
-  initClose();
-  initOpenPromptModalLink();
+
+  bindSettingsNavigation(modalEl, {
+    openAdminTab: openAdminSettingsTab,
+    onPanelActivated: onSettingsPanelActivated,
+  });
+
+  bindSettingsSearch(modalEl, {
+    isAdmin: () => !!window._isAdmin,
+    openPanel(tab) {
+      const button = modalEl.querySelector(`[data-settings-tab="${tab}"]`);
+      if (button) button.click();
+    },
+  });
+
+  bindSettingsSidebar(modalEl);
+
+  const registryIssues = getSettingsRegistryIssues(modalEl);
+  if (registryIssues.length) {
+    console.warn('Settings registry/DOM mismatch:', registryIssues);
+  }
+
+  bindSettingsDrag(modalEl);
+
+  bindSettingsClose(modalEl, {
+    closeSettings: close,
+    isTouchInsideModal: () => uiModule.isTouchInsideModal(),
+  });
+
+  bindOpenPromptModalLink({
+    getModal: () => modalEl,
+    closeSettings: close,
+  });
+
   initOpacityToggle();
   initialized = true;
   initDefaultChat();
@@ -2382,11 +2227,7 @@ async function initReminderSettings() {
       pubDebounce = setTimeout(async () => {
         try {
           const val = pubUrlIn.value.trim().replace(/\/+$/, '');
-          await fetch('/api/auth/settings', {
-            method: 'POST', credentials: 'same-origin',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ app_public_url: val }),
-          });
+          await _postSettings({ app_public_url: val });
           if (pubUrlMsg) {
             pubUrlMsg.textContent = val ? 'Saved' : 'Cleared (deep-links disabled)';
             pubUrlMsg.style.color = 'var(--green,#50fa7b)';
@@ -2425,11 +2266,16 @@ async function initReminderSettings() {
   // what the Integrations panel manages. Treat the email channel as
   // configured if there's at least one account with SMTP set.
   let emailAccounts = [];
+  const smtpAccountReady = (account) => !!(
+    account.smtp_host
+    && account.smtp_user
+    && (account.has_smtp_password || account.oauth_provider === 'google')
+  );
   try {
     const res = await fetch('/api/email/accounts', { credentials: 'same-origin' });
     if (res.ok) {
       const d = await res.json();
-      emailAccounts = (d.accounts || []).filter(a => a.smtp_host && a.smtp_user && a.has_smtp_password);
+      emailAccounts = (d.accounts || []).filter(smtpAccountReady);
     }
   } catch (_) {}
   let smtpConfigured = emailAccounts.length > 0;
@@ -2533,7 +2379,7 @@ async function initReminderSettings() {
       const res = await fetch('/api/email/accounts', { credentials: 'same-origin' });
       if (res.ok) {
         const d = await res.json();
-        emailAccounts = (d.accounts || []).filter(a => a.smtp_host && a.smtp_user && a.has_smtp_password);
+        emailAccounts = (d.accounts || []).filter(smtpAccountReady);
       }
     } catch (_) {}
     smtpConfigured = emailAccounts.length > 0;
@@ -2679,12 +2525,7 @@ async function initReminderSettings() {
 
   async function save(patch) {
     try {
-      await fetch('/api/auth/settings', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(patch),
-      });
+      await _postSettings(patch);
     } catch (e) { console.warn('Failed to save reminder settings', e); }
   }
 
@@ -2829,6 +2670,17 @@ async function initReminderSettings() {
 async function initEmailAccountsSettings() {
   const root = el('settings-modal');
   if (!root || !root.querySelector('[data-settings-panel="email"]')) return;
+
+  el('set-email-open-library-settings')?.addEventListener('click', async () => {
+    try {
+      const mod = await import('./emailLibrary.js?v=20260815approvalsave1');
+      if (typeof mod.openEmailLibrarySettings === 'function') {
+        await mod.openEmailLibrarySettings();
+      }
+    } catch (e) {
+      console.warn('Failed to open Email settings page', e);
+    }
+  });
   const manageBtn = el('set-email-open-integrations');
   if (manageBtn && manageBtn.dataset.bound !== '1') {
     manageBtn.dataset.bound = '1';
@@ -3061,12 +2913,14 @@ async function initEmailAccountsSettings() {
       const body = {
         name: el('eaf-name').value.trim() || el('eaf-from').value.trim(),
         from_address: el('eaf-from').value.trim(),
+        display_name: el('eaf-display-name').value.trim(),
         imap_host: el('eaf-imap-host').value.trim(),
         imap_port: parseInt(el('eaf-imap-port').value) || 993,
         imap_user: el('eaf-imap-user').value.trim(),
         imap_starttls: _effectiveEafImapStarttls(),
         smtp_host: el('eaf-smtp-host').value.trim(),
         smtp_port: parseInt(el('eaf-smtp-port').value) || 587,
+        smtp_security: el('eaf-smtp-security').value,
         smtp_user: el('eaf-imap-user').value.trim(),
       };
       if (!body.name) { el('eaf-msg').textContent = 'Enter a Name or Email first'; el('eaf-msg').style.color = 'var(--red)'; return; }
@@ -3159,24 +3013,31 @@ async function initEmailSettings() {
   const root = el('settings-modal');
   if (!root || !root.querySelector('[data-settings-panel="email"]')) return;
 
-  const styleKey = 'odysseus-email-writing-style';
+  const styleKey = () => {
+    const account = String(window.__odysseusActiveEmailAccount || '').trim();
+    return account ? `odysseus-email-writing-style:${account}` : 'odysseus-email-writing-style';
+  };
   const styleEl = el('set-email-style');
+  const emailAccountSuffix = () => {
+    const account = String(window.__odysseusActiveEmailAccount || '').trim();
+    return account ? `?account_id=${encodeURIComponent(account)}` : '';
+  };
 
   // The account/CardDAV config endpoints can be slow when remote mail servers
   // are cold. Populate the Writing Style box independently so saved prose does
   // not appear seconds after the panel opens.
   try {
-    const cachedStyle = localStorage.getItem(styleKey);
+    const cachedStyle = localStorage.getItem(styleKey());
     if (styleEl && cachedStyle !== null && !styleEl.value) styleEl.value = cachedStyle;
   } catch (_) {}
 
   const loadWritingStyle = async () => {
     try {
-      const res = await fetch('/api/email/style');
+      const res = await fetch(`/api/email/style${emailAccountSuffix()}`);
       const data = await res.json();
       const style = data.style || '';
       if (styleEl) styleEl.value = style;
-      try { localStorage.setItem(styleKey, style); } catch (_) {}
+      try { localStorage.setItem(styleKey(), style); } catch (_) {}
     } catch (_) {}
   };
   loadWritingStyle();
@@ -3288,7 +3149,7 @@ async function initEmailSettings() {
       }
     }
     try {
-      const res = await fetch('/api/email/extract-style', {
+      const res = await fetch(`/api/email/extract-style${emailAccountSuffix()}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sample_count: 15 }),
@@ -3296,7 +3157,7 @@ async function initEmailSettings() {
       const data = await res.json();
       if (data.success && data.style) {
         if (styleEl) styleEl.value = data.style;
-        try { localStorage.setItem(styleKey, data.style); } catch (_) {}
+        try { localStorage.setItem(styleKey(), data.style); } catch (_) {}
         if (msg) msg.textContent = '✓ Style extracted';
       } else {
         if (msg) msg.textContent = data.error || 'Failed';
@@ -3316,14 +3177,14 @@ async function initEmailSettings() {
     if (msg) msg.textContent = 'Saving...';
     try {
       const style = styleEl ? styleEl.value : '';
-      const res = await fetch('/api/email/style', {
+      const res = await fetch(`/api/email/style${emailAccountSuffix()}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ style }),
       });
       const result = await res.json();
       if (result.success) {
-        try { localStorage.setItem(styleKey, style); } catch (_) {}
+        try { localStorage.setItem(styleKey(), style); } catch (_) {}
       }
       if (msg) msg.textContent = result.success ? '✓ Saved' : 'Failed';
       setTimeout(() => { if (msg) msg.textContent = ''; }, 3000);
@@ -5806,61 +5667,35 @@ function syncAdminVisibility() {
    ═══════════════════════════════════════════ */
 export function open(tab) {
   if (!initialized) initAll();
-  // Invalidate animation/timer callbacks left by an interrupted close (for
-  // example, closing the Settings minimized chip and reopening immediately).
-  _closeGen++;
+
   syncAppearanceCheckboxes();
-  if (modalEl.classList.contains('hidden')) {
-    resetWindowPlacement();
-  }
-  // Cancel any pending close animation from a previous close
-  const content = modalEl.querySelector('.modal-content, .settings-modal-content');
-  if (content) {
-    content.classList.remove('modal-closing');
-  }
-  modalEl.classList.remove('hidden');
+  showSettingsModal(modalEl);
   syncAdminVisibility();
+
   if (tab) {
-    modalEl.querySelectorAll('[data-settings-tab]').forEach(b => b.classList.toggle('active', b.dataset.settingsTab === tab));
-    modalEl.querySelectorAll('[data-settings-panel]').forEach(p => p.classList.toggle('hidden', p.dataset.settingsPanel !== tab));
+    activateSettingsPanel(modalEl, tab);
   }
-  // Auto-init admin data if showing an admin tab
-  const activeTab = tab || (modalEl.querySelector('[data-settings-tab].active') || {}).dataset?.settingsTab || 'services';
-  document.body.classList.toggle('settings-appearance-open', activeTab === 'appearance');
-  syncAppearanceOpacity(activeTab === 'appearance');
-  if (activeTab === 'ai') refreshAiModelEndpoints();
-  if (ADMIN_TABS.has(activeTab) && window.adminModule && !window.adminModule._initialized) {
+
+  // Preserve existing panel-specific side effects when Settings is opened
+  // directly to a tab as well as when the user navigates there.
+  const activeTab = tab || getActiveSettingsTab(modalEl);
+  onSettingsPanelActivated(activeTab);
+
+  // Auto-init admin data if showing an admin tab.
+  if (isAdminManagedSettingsTab(activeTab) && window.adminModule && !window.adminModule._initialized) {
     window.adminModule._initData();
   }
 }
 
 export function close() {
   if (!modalEl) return;
-  const closeGen = ++_closeGen;
-  // Always clear the appearance-tab body class so the rest of the app
-  // doesn't keep its dimmed state if the modal got closed mid-tab.
+
+  // Always clear the Appearance state so the rest of the app does not remain
+  // dimmed if Settings is closed while that panel is active.
   document.body.classList.remove('settings-appearance-open');
-  syncAppearanceOpacity(false); // clear any opacity-slider fade
-  const content = modalEl.querySelector('.modal-content, .settings-modal-content');
-  if (content && !content.classList.contains('modal-closing')) {
-    content.classList.add('modal-closing');
+  syncAppearanceOpacity(false);
 
-    const finishClose = (event) => {
-      // Ignore animations from controls inside Settings. The fallback also
-      // detaches this listener when modalManager cancels the exit animation.
-      if (event && event.target !== content) return;
-      content.removeEventListener('animationend', finishClose);
-      if (closeGen !== _closeGen) return;
-      if (!content.classList.contains('modal-closing')) return;
-      modalEl.classList.add('hidden');
-      content.classList.remove('modal-closing');
-    };
-
-    content.addEventListener('animationend', finishClose);
-    setTimeout(finishClose, 250);
-  } else {
-    modalEl.classList.add('hidden');
-  }
+  hideSettingsModal(modalEl);
 }
 
 // Handle redirect back from Google OAuth2 — open settings to integrations and show status.
@@ -5872,29 +5707,30 @@ export function close() {
   window.history.replaceState(null, '', clean);
   const success = sp.has('email_oauth_success');
   const errMsg = sp.get('email_oauth_error') || '';
-  // Open settings → integrations after the app has initialised.
-  function _tryOpen() {
-    if (window.settingsModule && typeof window.settingsModule.open === 'function') {
-      window.settingsModule.open('integrations');
-      // Brief toast-style banner.
-      const banner = document.createElement('div');
-      banner.textContent = success
-        ? '✓ Google account connected — email is ready'
-        : `Google OAuth failed: ${errMsg || 'unknown error'}`;
-      Object.assign(banner.style, {
-        position: 'fixed', bottom: '24px', left: '50%', transform: 'translateX(-50%)',
-        background: success ? 'var(--accent, #50fa7b)' : 'var(--red, #ff5555)',
-        color: '#000', padding: '8px 18px', borderRadius: '6px', fontSize: '12px',
-        fontWeight: '600', zIndex: '99999', pointerEvents: 'none',
-        boxShadow: '0 2px 12px rgba(0,0,0,0.3)',
-      });
-      document.body.appendChild(banner);
-      setTimeout(() => banner.remove(), 4000);
-    } else {
-      setTimeout(_tryOpen, 100);
-    }
+  // Open settings → integrations once the document is ready. This module owns
+  // the open() API, so it does not need to wait for a window-level alias.
+  function _showResult() {
+    open('integrations');
+    // Brief toast-style banner.
+    const banner = document.createElement('div');
+    banner.textContent = success
+      ? 'Google account connected — email is ready'
+      : `Google OAuth failed: ${errMsg || 'unknown error'}`;
+    Object.assign(banner.style, {
+      position: 'fixed', bottom: '24px', left: '50%', transform: 'translateX(-50%)',
+      background: success ? 'var(--accent, #50fa7b)' : 'var(--red, #ff5555)',
+      color: '#000', padding: '8px 18px', borderRadius: '6px', fontSize: '12px',
+      fontWeight: '600', zIndex: '99999', pointerEvents: 'none',
+      boxShadow: '0 2px 12px rgba(0,0,0,0.3)',
+    });
+    document.body.appendChild(banner);
+    setTimeout(() => banner.remove(), 4000);
   }
-  _tryOpen();
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', _showResult, { once: true });
+  } else {
+    _showResult();
+  }
 })();
 
 const settingsModule = { open, close, initIntegrations, initUnifiedIntegrations, syncAdminVisibility, refreshAiModelEndpoints };

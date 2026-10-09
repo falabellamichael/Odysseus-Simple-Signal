@@ -110,3 +110,20 @@ BUILTIN_ACTION_INFO = {
     "audit_skills": "Audit unaudited skills after enough new skills are added: test, narrow metadata, self-edit/retry, optional teacher rewrite, tag duplicates/trivial skills, and publish/draft using the auto-approve threshold.",
     "check_email_urgency": "Scan unread emails hourly, tag urgent/reply-soon/newsletter/marketing/spam, and send a reminder when a new email needs a fast reply.",
 }
+
+
+# Compatibility exports for upstream callers of the former single module.
+from src.builtin_actions._urgency import (
+    _acquire_email_urgency_state_lock,
+    _close_email_urgency_state_lock,
+    _commit_email_urgency_state,
+    _email_urgency_account_generations,
+    _email_urgency_account_key,
+    _email_urgency_known_account_ids,
+    _email_urgency_payload_account_ids,
+    _email_urgency_stale_accounts,
+    _email_urgency_string_set,
+    _merge_email_urgency_state,
+    _read_email_urgency_state,
+    _run_email_urgency_state_transaction,
+)

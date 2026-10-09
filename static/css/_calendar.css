@@ -662,13 +662,15 @@ button.cal-add-btn.cal-add-btn-text.cal-add-btn-sm:hover .cal-add-label {
 
   #email-lib-folder,
   .memory-category-filters .email-filter-select-btn,
-  .memory-category-filters .email-filter-refresh-btn {
+  .memory-category-filters .email-filter-refresh-btn,
+  .memory-category-filters .email-filter-settings-btn {
     height: 30px !important;
     min-height: 30px !important;
     box-sizing: border-box;
   }
 
-  .memory-category-filters .email-filter-refresh-btn {
+  .memory-category-filters .email-filter-refresh-btn,
+  .memory-category-filters .email-filter-settings-btn {
     width: 30px;
     padding: 0 !important;
   }
@@ -696,9 +698,14 @@ button.cal-add-btn.cal-add-btn-text.cal-add-btn-sm:hover .cal-add-label {
     top: 0 !important;
   }
 
-  #email-lib-search::placeholder {
-    font-size: 14px !important;
-  }
+	  #email-lib-search::placeholder {
+	    font-size: 14px !important;
+	  }
+
+	  #email-lib-chip-bar.has-email-lib-pills #email-lib-search {
+	    min-width: 24px !important;
+	    flex: 1 1 24px !important;
+	  }
 
   .email-lib-pill {
     min-height: 24px !important;
@@ -828,6 +835,38 @@ button.cal-add-btn.cal-add-btn-text.cal-add-btn-sm:hover .cal-add-label {
 }
 #email-lib-accounts::-webkit-scrollbar { display: none; height: 0; }
 #email-lib-accounts > * { flex-shrink: 0; scroll-snap-align: start; }
+.email-account-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.email-account-chip.email-account-has-unread {
+  border-color: color-mix(in srgb, var(--accent, var(--red)) 42%, var(--border));
+  background: color-mix(in srgb, var(--accent, var(--red)) 10%, transparent);
+  color: color-mix(in srgb, var(--accent, var(--red)) 86%, var(--fg));
+}
+.email-account-unread-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--accent, var(--red));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent, var(--red)) 14%, transparent);
+  flex: 0 0 auto;
+}
+.email-account-chip-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.email-account-unread-count {
+  font-size: 9px;
+  line-height: 1;
+  font-weight: 700;
+  color: var(--accent, var(--red));
+  opacity: 0.9;
+  position: relative;
+  top: 1px;
+}
 .email-accounts-loading-whirlpool {
   width: 14px;
   height: 14px;
@@ -878,6 +917,24 @@ button.cal-add-btn.cal-add-btn-text.cal-add-btn-sm:hover .cal-add-label {
 #session-list .date-section-header {
   padding-left: 10px;
   padding-right: 8px;
+  cursor: pointer;
+}
+#session-list .date-section-header.collapsed {
+  color: color-mix(in srgb, var(--fg) 36%, transparent);
+}
+#session-list .date-section-header.collapsed::after {
+  opacity: 0.45;
+}
+#session-list .date-section-header:focus-visible {
+  outline: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  outline-offset: 2px;
+  border-radius: 5px;
+}
+/* Bootstrap row shown while the session list hydrates, and on load failure.
+   Reads as a normal list row but is not selectable. */
+.session-list-bootstrap {
+  cursor: default;
+  pointer-events: none;
 }
 #email-lib-grid .date-section-header {
   padding: 10px 5px 3px;

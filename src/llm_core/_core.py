@@ -1,6 +1,7 @@
 # src/llm_core.py
 import httpx
 import asyncio
+import copy
 import time
 import json
 import logging
@@ -8,6 +9,7 @@ import hashlib
 import threading
 import re
 import os
+import math
 from contextlib import asynccontextmanager
 from fastapi import HTTPException
 from typing import Optional, Dict, List, Tuple
@@ -19,6 +21,53 @@ logger = logging.getLogger(__name__)
 _LOCAL_MODEL_LOCK = asyncio.Lock()
 _LOCAL_MODEL_WAITING_FOREGROUND = 0
 _LOCAL_MODEL_CURRENT: Dict[str, object] = {}
+
+
+def _normalize_usage_counts(input_value=0, output_value=0):
+    """Return safe integer token counts, or ``None`` for malformed usage."""
+
+    def _count(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        if isinstance(value, int):
+            count = value
+        else:
+            if not math.isfinite(value) or not value.is_integer():
+                return None
+            count = int(value)
+        if count < 0 or count > (2**63 - 1):
+            return None
+        return count
+
+    input_tokens = _count(input_value)
+    output_tokens = _count(output_value)
+    if input_tokens is None or output_tokens is None:
+        return None
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+    }
+
+
+def _normalize_http_status(value) -> Optional[int]:
+    """Accept only genuine three-digit integral HTTP status values."""
+
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        status = value
+    elif isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            return None
+        status = int(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not re.fullmatch(r"\d{3}", text):
+            return None
+        status = int(text)
+    else:
+        return None
+    return status if 100 <= status <= 599 else None
 
 
 def _local_model_gate_enabled() -> bool:
@@ -108,6 +157,12 @@ class LLMConfig:
     CONNECT_TIMEOUT = float(os.getenv('LLM_CONNECT_TIMEOUT', '10') or '10')
 
 
+class _FallbackIneligibleHTTPException(HTTPException):
+    """HTTP-shaped provider failure that must never advance a route chain."""
+
+    fallback_eligible = False
+
+
 def _call_timeout(read_timeout) -> httpx.Timeout:
     """Per-request timeout for non-streaming LLM calls (connect from config)."""
     return httpx.Timeout(connect=LLMConfig.CONNECT_TIMEOUT, read=float(read_timeout), write=10.0, pool=5.0)
@@ -119,9 +174,28 @@ def _stream_timeout(read_timeout) -> httpx.Timeout:
 
 
 # Cache for LLM responses
+def _cache_header_identity(headers) -> str:
+    """Return a non-secret identity for credential-distinct request routes."""
+
+    if isinstance(headers, str):
+        try:
+            headers = json.loads(headers)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            headers = {"_raw": headers}
+    if not isinstance(headers, dict):
+        headers = {}
+    canonical = [
+        (str(key).strip().lower(), str(value))
+        for key, value in headers.items()
+    ]
+    canonical.sort()
+    encoded = json.dumps(canonical, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
 def _get_cache_key(url: str, model: str, messages: List[Dict],
-                   temperature: float, max_tokens: int) -> str:
-    """Generate cache key for LLM requests."""
+                   temperature: float, max_tokens: int, headers=None) -> str:
+    """Generate a cache key partitioned by endpoint and credential identity."""
     hashable_messages = []
     for msg in messages:
         sorted_items = tuple(sorted(msg.items()))
@@ -132,11 +206,16 @@ def _get_cache_key(url: str, model: str, messages: List[Dict],
         'model': model,
         'messages': hashable_messages,
         'temp': temperature,
-        'max_tokens': max_tokens
+        'max_tokens': max_tokens,
+        # Never put credentials in a cache key or loggable cache payload.  The
+        # digest only prevents responses from one configured account/route
+        # being returned under another route with the same URL and model.
+        'header_identity': _cache_header_identity(headers),
     }, sort_keys=True)
     return hashlib.sha256(content.encode()).hexdigest()
 
 _response_cache = {}
+_response_model_cache = {}
 
 # Dead-host cooldown: maps host (scheme://host:port) -> unix ts when cooldown expires.
 # When a connect to a host fails, we mark it dead for DEAD_HOST_COOLDOWN seconds so
@@ -340,7 +419,7 @@ class _DegenerateStreamGuard:
             f"Stopped generation: {self.model} started repeating tokens "
             f"({reason}). Try a different model or lower temperature."
         )
-        return f'event: error\ndata: {json.dumps({"status": 502, "text": message, "error": message})}\n\n'
+        return f'event: error\ndata: {json.dumps({"status": 502, "text": message, "error": message, "fallback_eligible": False})}\n\n'
 
 
 def _model_activity_key(url: str, model: str) -> str:
@@ -348,6 +427,29 @@ def _model_activity_key(url: str, model: str) -> str:
 
 def _same_model_identity(left: str, right: str) -> bool:
     return (left or "").strip().lower() == (right or "").strip().lower()
+
+def _reported_model_name(value) -> str:
+    """Return a provider model identifier only when it is usable metadata."""
+    return value.strip() if isinstance(value, str) and value.strip() else ""
+
+
+def _model_actual_event(requested_model: str, reported_model) -> Optional[str]:
+    """Build a provenance event when a provider resolves a different model."""
+    actual_model = _reported_model_name(reported_model)
+    if not actual_model or _same_model_identity(actual_model, requested_model):
+        return None
+    return f'data: {json.dumps({"type": "model_actual", "requested_model": requested_model, "model": actual_model})}\n\n'
+
+
+def _annotate_usage_model(usage: dict, requested_model: str, actual_model: str) -> dict:
+    """Attach provider model provenance to a normalized usage payload."""
+    actual_model = _reported_model_name(actual_model)
+    if actual_model:
+        usage["model"] = actual_model
+        if not _same_model_identity(actual_model, requested_model):
+            usage["requested_model"] = requested_model
+    return usage
+
 
 def note_model_activity(url: str, model: str):
     """Record that a real upstream request used this endpoint/model."""
@@ -419,7 +521,19 @@ def _get_cached_response(cache_key: str) -> Optional[str]:
     """Get cached response if it exists."""
     return _response_cache.get(cache_key)
 
-def _set_cached_response(cache_key: str, response: str) -> None:
+
+def _get_cached_response_model(cache_key: str) -> Optional[str]:
+    """Return provider-reported model metadata paired with a cached reply."""
+    model = _response_model_cache.get(cache_key)
+    return model if isinstance(model, str) and model.strip() else None
+
+
+def _set_cached_response(
+    cache_key: str,
+    response: str,
+    *,
+    actual_model: Optional[str] = None,
+) -> None:
     """Store response in cache."""
     if len(_response_cache) > 128:
         keys_to_remove = list(_response_cache.keys())[:64]
@@ -428,7 +542,12 @@ def _set_cached_response(cache_key: str, response: str) -> None:
             # threadpool) may have already evicted the same snapshotted key,
             # and del would raise KeyError mid-eviction (issue #659).
             _response_cache.pop(key, None)
+            _response_model_cache.pop(key, None)
     _response_cache[cache_key] = response
+    if isinstance(actual_model, str) and actual_model.strip():
+        _response_model_cache[cache_key] = actual_model.strip()
+    else:
+        _response_model_cache.pop(cache_key, None)
 
 # ── Anthropic native API adapter ──
 
@@ -644,7 +763,7 @@ def _build_ollama_payload(
     if options:
         payload["options"] = options
     if tools:
-        payload["tools"] = tools
+        payload["tools"] = _alias_harmony_tools(tools, model)
     return payload
 
 
@@ -766,6 +885,36 @@ def apply_kimi_code_headers(headers: Optional[Dict], url: str) -> Dict[str, str]
     return h
 
 
+async def apply_kimi_code_headers_async(client, headers: Optional[Dict], url: str) -> Dict[str, str]:
+    """Pick a Kimi Code User-Agent without blocking the event loop."""
+    h = dict(headers or {})
+    if not _is_kimi_code_url(url):
+        return h
+    base_key = _kimi_code_base_key(url)
+    cached = _kimi_code_ua_cache.get(base_key)
+    if cached:
+        h["User-Agent"] = cached
+        return h
+    models_url = base_key.rstrip("/") + "/models"
+    for ua in KIMI_CODE_USER_AGENTS:
+        trial = dict(h)
+        trial["User-Agent"] = ua
+        try:
+            r = await client.get(models_url, headers=trial, timeout=8)
+        except Exception:
+            continue
+        if _is_kimi_code_access_denied(r.status_code, r.content):
+            logger.debug("Kimi Code rejected User-Agent %s (403), trying next", ua)
+            continue
+        if r.status_code < 400:
+            _remember_kimi_code_user_agent(url, ua)
+            h["User-Agent"] = ua
+            return h
+        break
+    h.setdefault("User-Agent", KIMI_CODE_USER_AGENT)
+    return h
+
+
 def httpx_get_kimi_aware(url: str, headers: Optional[Dict], **kwargs):
     h = apply_kimi_code_headers(headers, url)
     if not _is_kimi_code_url(url):
@@ -799,7 +948,7 @@ def httpx_post_kimi_aware(url: str, headers: Optional[Dict], **kwargs):
 
 
 async def httpx_post_kimi_aware_async(client, url: str, headers: Optional[Dict], **kwargs):
-    h = apply_kimi_code_headers(headers, url)
+    h = await apply_kimi_code_headers_async(client, headers, url)
     if not _is_kimi_code_url(url):
         return await client.post(url, headers=h, **kwargs)
     last = None
@@ -950,7 +1099,7 @@ def _provider_headers(provider: str, headers: Optional[Dict] = None) -> Dict[str
     if isinstance(headers, dict):
         h.update(headers)
     if provider == "openrouter":
-        h.setdefault("HTTP-Referer", "https://github.com/pewdiepie-archdaemon/odysseus")
+        h.setdefault("HTTP-Referer", "https://github.com/odysseus-dev/odysseus")
         h.setdefault("X-OpenRouter-Title", "Odysseus")
     if provider == "copilot":
         # Ensure the Copilot-required headers are present even when the caller
@@ -1010,6 +1159,82 @@ def _provider_label(url: str) -> str:
         # discovery (see ModelDiscovery._fingerprint_provider); this stays neutral.
         return "local endpoint"
     return host or "provider"
+
+
+def _is_openai_hosted_chat_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url or "")
+    except Exception:
+        return False
+    path = (parsed.path or "").rstrip("/")
+    return _host_match(url, "openai.com") and path.endswith("/chat/completions")
+
+
+def _model_disallows_reasoning_effort_with_chat_tools(model: str) -> bool:
+    """OpenAI GPT 5.x variants reject reasoning_effort + tools on chat completions."""
+    m = (model or "").strip().lower()
+    return bool(re.match(r"^(?:openai/)?gpt-5(?:[.\-]\d+)?(?:[-_:].*)?$", m))
+
+
+# gpt-oss (harmony) ships BUILT-IN tools named `python` and `browser`, invoked
+# with the raw body as the argument (`to=python` + bare source), while custom
+# functions use `to=functions.NAME` + JSON. A tool we expose under a built-in's
+# name therefore gets called with the built-in convention: the model emits raw
+# code, the server tries to parse it as JSON, and the whole request dies
+# ("error parsing tool call: raw='import sys, ...'"). In streaming mode Ollama
+# does not even report it — it truncates the stream, so the turn looks like an
+# empty response. `bash` collides the same way in practice.
+#
+# Measured on gpt-oss:20b via Ollama /v1 with a fixed agentic prompt:
+#   tools named python+bash ............ 2/6 succeeded (4 parse failures)
+#   python renamed ..................... 5/6
+#   python and bash renamed ............ 6/6
+#
+# So rename the colliding tools on the way out and map the names back on the
+# way in. Confined to the transport layer: callers keep using the real names.
+_HARMONY_TOOL_ALIASES = {
+    "python": "run_python_code",
+    "bash": "run_shell_command",
+    "browser": "web_browser_tool",
+}
+_HARMONY_TOOL_ALIASES_REVERSE = {v: k for k, v in _HARMONY_TOOL_ALIASES.items()}
+
+
+def _is_harmony_model(model: str) -> bool:
+    """True for gpt-oss / harmony-format models, which have built-in tool names."""
+    return "gpt-oss" in (model or "").lower()
+
+
+def _alias_harmony_tools(tools: Optional[List[Dict]], model: str) -> Optional[List[Dict]]:
+    """Rename tools that collide with harmony built-ins. Returns a copy."""
+    if not tools or not _is_harmony_model(model):
+        return tools
+    out = []
+    for t in tools:
+        fn = t.get("function") or {}
+        alias = _HARMONY_TOOL_ALIASES.get(fn.get("name"))
+        if alias:
+            t = copy.deepcopy(t)
+            t["function"]["name"] = alias
+        out.append(t)
+    return out
+
+
+def _unalias_harmony_tool_name(name: str, model: str) -> str:
+    """Map an aliased tool name in a model response back to the real name."""
+    if not _is_harmony_model(model):
+        return name
+    return _HARMONY_TOOL_ALIASES_REVERSE.get(name, name)
+
+
+def _scrub_openai_chat_tool_reasoning(payload: Dict, target_url: str, model: str) -> None:
+    if not payload.get("tools"):
+        return
+    if not _is_openai_hosted_chat_url(target_url):
+        return
+    if not _model_disallows_reasoning_effort_with_chat_tools(model):
+        return
+    payload["reasoning_effort"] = "none"
 
 
 def _normalize_chatgpt_subscription_url(url: str) -> str:
@@ -1184,15 +1409,27 @@ def _anthropic_rejects_temperature(model: str) -> bool:
         return False
     # `(?<![a-z])` anchors "opus" to a word boundary so a substring match like
     # `oct-opus`/`octopus-4-8` can't be read as Opus (it would otherwise strip
-    # temperature). Cap the minor at 1-2 digits and forbid a trailing digit so a
-    # dated id like `claude-opus-4-20250514` (Opus 4.0) parses as major-only (no
-    # minor match, kept) instead of reading the date `20250514` as a giant minor
-    # that would falsely test >= 4.7. Dated 4.7+ snapshots (`claude-opus-4-7-
-    # 20260201`) keep their explicit minor and are still matched.
-    match = re.search(r"(?<![a-z])opus[-_]?(\d+)[-_.](\d{1,2})(?!\d)", model.lower())
+    # temperature). Both version components are capped at 1-2 digits and forbid a
+    # trailing digit, so an 8-digit date can never be read as a version number:
+    # `claude-opus-4-20250514` (Opus 4.0) parses as major-only rather than reading
+    # `20250514` as a giant minor, and `claude-3-opus-20240229` (legacy Claude 3
+    # Opus, date directly after "opus-") fails to match at all rather than reading
+    # the date as a giant major. Dated 4.7+ snapshots (`claude-opus-4-7-20260201`)
+    # keep their explicit minor and are still matched.
+    #
+    # The minor is optional and a missing minor reads as `.0`, so major-only ids
+    # like `claude-opus-5` are correctly treated as >= 4.7 (issue #5753). Without
+    # this, every Opus 5 call kept `temperature` and failed with HTTP 400 — visible
+    # only on paths that pass a temperature, e.g. scheduled tasks inheriting
+    # `stream_agent_loop`'s 0.3 default, which returned empty responses.
+    match = re.search(
+        r"(?<![a-z])opus[-_]?(\d{1,2})(?!\d)(?:[-_.](\d{1,2})(?!\d))?", model.lower()
+    )
     if not match:
         return False
-    return (int(match.group(1)), int(match.group(2))) >= (4, 7)
+    major = int(match.group(1))
+    minor = int(match.group(2)) if match.group(2) else 0
+    return (major, minor) >= (4, 7)
 
 # Reasoning effort level sent to Mistral thinking-capable models. Mistral's
 # API accepts "high", "medium", "low", "none" — see
@@ -1202,8 +1439,8 @@ _MISTRAL_REASONING_EFFORT = os.getenv("ODYSSEUS_MISTRAL_REASONING_EFFORT", "high
 
 # Models that support structured thinking — may output </think> without opening tag
 _THINKING_MODEL_PATTERNS = (
-    "qwen3", "qwq", "deepseek-r1", "deepseek-reasoner", "minimax",
-    "m2-reap", "gemma", "stepfun", "step-3", "step3",
+    "qwen3", "qwq", "deepseek-r1", "deepseek-reasoner", "deepseek-v4",
+    "minimax", "m2-reap", "gemma", "stepfun", "step-3", "step3",
     "magistral", "mistral-small", "mistral-medium",
 )
 

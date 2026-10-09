@@ -24,6 +24,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import uuid
 from contextvars import ContextVar
+from urllib.parse import parse_qs, unquote, urlparse
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -129,20 +130,36 @@ def _mcp_owner_required(rows: list[dict] | None = None) -> bool:
     return _has_owner_scoped_accounts(rows)
 
 
-def _load_email_writing_style() -> str:
-    """Return the existing Settings > Email > Writing Style value."""
+def _load_email_writing_style(account: str | None = None) -> str:
+    """Return the saved Settings > Email > Writing Style value.
+
+    Prefer the selected account's style when one exists; fall back to the
+    legacy global style so older installs keep behaving as before.
+    """
     try:
         settings_path = DATA_DIR / "settings.json"
         if not settings_path.exists():
             return ""
         settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        account_id = ""
+        if account:
+            try:
+                cfg = _load_config(account)
+                account_id = str(cfg.get("account_id") or account or "").strip()
+            except Exception:
+                account_id = str(account or "").strip()
+        by_account = settings.get("email_writing_styles_by_account") or {}
+        if account_id and isinstance(by_account, dict):
+            style = by_account.get(account_id)
+            if isinstance(style, str) and style.strip():
+                return style.strip()
         return str(settings.get("email_writing_style") or "").strip()
     except Exception:
         return ""
 
 
-def _writing_style_guidance() -> str:
-    style = _load_email_writing_style()
+def _writing_style_guidance(account: str | None = None) -> str:
+    style = _load_email_writing_style(account)
     if not style:
         return (
             "No saved writing style is configured in Settings > Email > Writing Style. "
@@ -507,6 +524,251 @@ def _decode_header(raw):
             else:
                 decoded.append(data)
         return "".join(decoded)
+
+
+def _uid_from_fetch_meta(meta_b: bytes) -> str:
+    m = re.search(rb"UID\s+(\d+)", meta_b or b"")
+    return m.group(1).decode("ascii", errors="ignore") if m else ""
+
+
+def _parse_list_unsubscribe_header(value: str | None) -> list[dict]:
+    raw = str(value or "").strip()
+    if not raw:
+        return []
+    pieces = re.findall(r"<([^>]+)>", raw)
+    if not pieces:
+        pieces = [p.strip() for p in raw.split(",") if p.strip()]
+    out: list[dict] = []
+    seen = set()
+    for piece in pieces:
+        target = piece.strip().strip("<>").strip()
+        if not target:
+            continue
+        parsed = urlparse(target)
+        scheme = parsed.scheme.lower()
+        key = target.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if scheme == "mailto":
+            addr = unquote(parsed.path or "").strip()
+            if not addr or "\r" in addr or "\n" in addr:
+                continue
+            query = parse_qs(parsed.query or "", keep_blank_values=True)
+            subject = unquote((query.get("subject") or ["unsubscribe"])[0] or "unsubscribe")
+            body = unquote((query.get("body") or ["unsubscribe"])[0] or "unsubscribe")
+            subject = re.sub(r"[\r\n]+", " ", subject).strip() or "unsubscribe"
+            body = re.sub(r"[\r\n]+", "\n", body).strip() or "unsubscribe"
+            out.append({
+                "kind": "mailto",
+                "target": addr,
+                "subject": subject[:200],
+                "body": body[:1000],
+                "executable": True,
+            })
+        elif scheme in {"http", "https"}:
+            out.append({
+                "kind": "url",
+                "target": target,
+                "executable": False,
+            })
+    return out
+
+
+def _email_unsubscribe_candidate_from_msg(msg, uid: str, folder: str) -> dict | None:
+    sender = _decode_header(msg.get("From", ""))
+    sender_name, sender_addr = email.utils.parseaddr(sender)
+    subject = _decode_header(msg.get("Subject", "(no subject)"))
+    list_id = _decode_header(msg.get("List-Id", ""))
+    precedence = (msg.get("Precedence") or "").strip().lower()
+    auto_submitted = (msg.get("Auto-Submitted") or "").strip().lower()
+    methods = _parse_list_unsubscribe_header(msg.get("List-Unsubscribe"))
+    if not methods:
+        return None
+    reasons: list[str] = ["has unsubscribe header"]
+    score = 45
+    if list_id:
+        score += 20
+        reasons.append("mailing-list header")
+    if precedence in {"bulk", "junk", "list"}:
+        score += 20
+        reasons.append(f"precedence={precedence}")
+    if auto_submitted and auto_submitted != "no":
+        score += 10
+        reasons.append(f"auto-submitted={auto_submitted}")
+    if re.search(r"\b(unsubscribe|newsletter|sale|discount|offer|promo|limited time)\b", (subject or "").lower()):
+        score += 10
+        reasons.append("promotional subject")
+    executable = [m for m in methods if m.get("executable")]
+    return {
+        "uid": str(uid),
+        "folder": folder,
+        "message_id": (msg.get("Message-ID") or "").strip(),
+        "subject": subject,
+        "from_name": sender_name or sender_addr,
+        "from_address": sender_addr,
+        "list_id": list_id,
+        "score": min(score, 100),
+        "reasons": reasons[:5],
+        "methods": methods,
+        "can_execute": bool(executable),
+        "recommended_method": executable[0] if executable else methods[0],
+    }
+
+
+def _unsubscribe_candidate_dedupe_key(candidate: dict) -> tuple[str, str, str]:
+    list_id = str(candidate.get("list_id") or "").strip().lower()
+    method = candidate.get("recommended_method") or {}
+    method_kind = str(method.get("kind") or "").strip().lower()
+    method_target = str(method.get("target") or "").strip().lower()
+    sender = str(candidate.get("from_address") or "").strip().lower()
+    if list_id:
+        return ("list", list_id, method_target or sender)
+    if method_target:
+        return ("method", method_kind, method_target)
+    return ("sender", sender, str(candidate.get("subject") or "").strip().lower())
+
+
+def _dedupe_unsubscribe_candidates(candidates: list[dict]) -> list[dict]:
+    deduped: dict[tuple[str, str, str], dict] = {}
+    for candidate in candidates or []:
+        key = _unsubscribe_candidate_dedupe_key(candidate)
+        existing = deduped.get(key)
+        if not existing:
+            copy = dict(candidate)
+            copy["duplicate_count"] = 1
+            copy["duplicate_uids"] = [str(candidate.get("uid") or "")]
+            deduped[key] = copy
+            continue
+        existing["duplicate_count"] = int(existing.get("duplicate_count") or 1) + 1
+        uid = str(candidate.get("uid") or "")
+        if uid:
+            existing.setdefault("duplicate_uids", []).append(uid)
+        if int(candidate.get("score") or 0) > int(existing.get("score") or 0):
+            keep_count = existing.get("duplicate_count")
+            keep_uids = existing.get("duplicate_uids")
+            replacement = dict(candidate)
+            replacement["duplicate_count"] = keep_count
+            replacement["duplicate_uids"] = keep_uids
+            deduped[key] = replacement
+    return list(deduped.values())
+
+
+def _scan_unsubscribe_candidates(folder="INBOX", account=None, limit=25, max_scan=150) -> dict:
+    limit = max(1, min(int(limit or 25), 100))
+    max_scan = max(limit, min(int(max_scan or 150), 500))
+    folder = folder or "INBOX"
+    candidates: list[dict] = []
+    conn = _imap_connect(account)
+    try:
+        status, _ = conn.select(_q(folder), readonly=True)
+        if status != "OK":
+            return {"success": False, "error": f"Folder not found: {folder}", "candidates": []}
+        status, data = conn.uid("SEARCH", None, "ALL")
+        if status != "OK" or not data or not data[0]:
+            return {"success": True, "candidates": [], "total": 0, "scanned": 0, "folder": folder}
+        uids = []
+        for raw_uid in data[0].split():
+            try:
+                uids.append(int(raw_uid))
+            except Exception:
+                continue
+        uids = sorted(uids, reverse=True)[:max_scan]
+        if not uids:
+            return {"success": True, "candidates": [], "total": 0, "scanned": 0, "folder": folder}
+        status, msg_data = conn.uid("FETCH", _b(",".join(str(u) for u in uids)), "(UID RFC822.HEADER)")
+    finally:
+        try:
+            conn.logout()
+        except Exception:
+            pass
+    if status != "OK":
+        return {"success": False, "error": "Failed to fetch email headers", "candidates": []}
+    for item in msg_data or []:
+        if not isinstance(item, tuple) or len(item) < 2:
+            continue
+        meta_b = item[0] if isinstance(item[0], bytes) else str(item[0]).encode()
+        uid = _uid_from_fetch_meta(meta_b)
+        if not uid:
+            continue
+        try:
+            msg = email.message_from_bytes(item[1] or b"")
+        except Exception:
+            continue
+        candidate = _email_unsubscribe_candidate_from_msg(msg, uid, folder)
+        if candidate:
+            candidates.append(candidate)
+    raw_total = len(candidates)
+    candidates = _dedupe_unsubscribe_candidates(candidates)
+    candidates.sort(key=lambda c: (int(c.get("score") or 0), int(c.get("duplicate_count") or 1), int(c.get("uid") or 0)), reverse=True)
+    return {
+        "success": True,
+        "candidates": candidates[:limit],
+        "total": len(candidates),
+        "raw_total": raw_total,
+        "scanned": len(uids),
+        "folder": folder,
+        "account": account or "",
+    }
+
+
+def _unsubscribe_email(uid, folder="INBOX", account=None, method_index=0, allow_web=False) -> dict:
+    uid = str(uid or "").strip()
+    if not uid:
+        return {"success": False, "error": "uid is required"}
+    conn = _imap_connect(account)
+    try:
+        status, _ = conn.select(_q(folder), readonly=True)
+        if status != "OK":
+            return {"success": False, "error": f"Folder not found: {folder}"}
+        status, msg_data = conn.uid("FETCH", _b(uid), "(UID RFC822.HEADER)")
+    finally:
+        try:
+            conn.logout()
+        except Exception:
+            pass
+    if status != "OK" or not msg_data:
+        return {"success": False, "error": f"Email not found: {uid}"}
+    raw_header = b""
+    for item in msg_data or []:
+        if isinstance(item, tuple) and len(item) >= 2:
+            raw_header = item[1] or b""
+            break
+    msg = email.message_from_bytes(raw_header)
+    candidate = _email_unsubscribe_candidate_from_msg(msg, uid, folder)
+    if not candidate:
+        return {"success": False, "error": "No List-Unsubscribe header found"}
+    methods = candidate.get("methods") or []
+    method_index = int(method_index or 0)
+    method = methods[method_index] if 0 <= method_index < len(methods) else (candidate.get("recommended_method") or methods[0])
+    if method.get("kind") == "url":
+        return {
+            "success": False,
+            "requires_browser": True,
+            "url": method.get("target"),
+            "candidate": candidate,
+            "instructions": (
+                "This unsubscribe is a web link. Ask the user for approval, then use the browser/web tool "
+                "to open the exact URL and complete the unsubscribe page. Do not fetch unrelated links."
+            ),
+        }
+    if method.get("kind") != "mailto" or not method.get("executable"):
+        return {"success": False, "error": "Unsupported unsubscribe method", "candidate": candidate}
+    result = _send_email(
+        to=method.get("target"),
+        subject=method.get("subject") or "unsubscribe",
+        body=method.get("body") or "unsubscribe",
+        account=account,
+    )
+    if "error" in result:
+        return {"success": False, "error": result["error"], "candidate": candidate}
+    return {
+        "success": True,
+        "method": method,
+        "candidate": candidate,
+        "send_result": result,
+        "pending": bool(result.get("pending")),
+    }
 
 
 def _extract_text(msg):
@@ -1540,14 +1802,12 @@ async def _ai_draft_reply_to_email(uid, folder="INBOX", reply_all=False, account
         from src.endpoint_resolver import (
             resolve_endpoint,
             resolve_utility_fallback_candidates,
-            resolve_chat_fallback_candidates,
         )
         from src.llm_core import llm_call_async_with_fallback
     except Exception as exc:
         return {"error": f"AI reply helpers unavailable: {exc}"}
 
-    settings = _load_settings()
-    style = settings.get("email_writing_style", "")
+    style = _load_email_writing_style(account)
     system_prompt = _EMAIL_REPLY_SYS_PROMPT_BASE
     if style:
         system_prompt += f"\n\nWRITING STYLE TO MATCH:\n{style}"
@@ -1582,13 +1842,6 @@ async def _ai_draft_reply_to_email(uid, folder="INBOX", reply_all=False, account
         utility_fallbacks = resolve_utility_fallback_candidates() or []
     for cand in utility_fallbacks:
         _add(*cand)
-    try:
-        chat_fallbacks = resolve_chat_fallback_candidates(owner=None) or []
-    except TypeError:
-        chat_fallbacks = resolve_chat_fallback_candidates() or []
-    for cand in chat_fallbacks:
-        _add(*cand)
-
     if not candidates:
         return {"error": "No LLM endpoint configured for AI reply"}
 

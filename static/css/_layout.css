@@ -179,6 +179,31 @@
       transition: background 0.1s;
     }
     .export-dropdown-item:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+    #export-compact-btn {
+      justify-content: flex-start;
+      gap: 10px;
+      margin: 0;
+      padding: 6px 8px;
+      border-radius: 6px;
+      color: var(--fg);
+      font-weight: inherit;
+      --ctx-stroke: var(--color-muted, #888);
+    }
+    #export-compact-btn:hover {
+      --ctx-stroke: var(--ctx-color);
+    }
+    #export-compact-btn .dropdown-icon {
+      opacity: 0.7;
+    }
+    .export-compact-pill {
+      display: inline;
+      padding: 0;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      color: inherit;
+      line-height: inherit;
+    }
     .export-dropdown-item .dropdown-icon {
       width: 14px; height: 14px;
       display: flex; align-items: center; justify-content: center;
@@ -198,6 +223,11 @@
         font-size: 14px;
         gap: 12px;
         min-height: 44px;
+      }
+      #export-compact-btn {
+        margin: 5px 6px 7px;
+        min-height: 38px;
+        padding: 9px 14px;
       }
       .export-dropdown-item .dropdown-icon {
         width: 18px; height: 18px; opacity: 0.7;
@@ -517,7 +547,7 @@
       flex-shrink: 0;
       background: var(--panel);
       border-right: 1px solid var(--border);
-      display: flex;
+      display: none;
       flex-direction: column;
       align-items: center;
       padding: 48px 4px 8px 4px;
@@ -528,6 +558,23 @@
       /* Allow hover labels (e.g. the rail-new-chat "New" tooltip) to extend
          outside the 48px column. overflow:hidden was clipping them. */
       overflow: visible;
+    }
+    body.sidebar-collapsed:not(.hamburger-only) .icon-rail,
+    html.ody-sidebar-mini .icon-rail {
+      display: flex;
+    }
+    html.ody-sidebar-mini .sidebar,
+    html.ody-sidebar-off .sidebar {
+      width: 0 !important;
+      min-width: 0 !important;
+      opacity: 0;
+      overflow: hidden;
+      pointer-events: none;
+      padding: 0 !important;
+      border: 0 !important;
+    }
+    html.ody-sidebar-off .icon-rail {
+      display: none !important;
     }
     .rail-resize-handle {
       position: absolute;
@@ -708,8 +755,8 @@
       0%,100% { opacity: 1; }
       50%     { opacity: 0.4; }
     }
-    /* Compact `_` minimize button for modal headers — matches the close
-       button's bordered square so the two read as a paired control. The
+    /* Compact minimize button for modal headers — matches the close
+       button's round control so the two read as a paired set. The
        header's h4 carries margin-right:auto, which groups minimize + close
        on the right; this button just needs a small gap before close. */
     .modal-minimize-btn,
@@ -727,7 +774,7 @@
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      border-radius: 4px;
+      border-radius: 999px;
       flex-shrink: 0;
       transition: background 0.15s, color 0.15s;
     }
@@ -753,6 +800,9 @@
       min-height: 0;
       overflow-y: auto;
       -webkit-overflow-scrolling: touch;
+    }
+    .modal-minimize-btn svg {
+      transform: translateY(2px);
     }
     .modal.modal-minimized { display: none !important; }
     /* Window tile snap ghost (desktop only) */
@@ -1568,6 +1618,10 @@
       transform: scale(0.985);
       transition: background 0.08s ease, transform 0.08s ease;
     }
+    #models.models-refreshing {
+      opacity: 0.72;
+      transition: opacity 0.16s ease;
+    }
     /* Disabled tool — dimmed to signal its feature is turned off globally */
     .list-item.tool-disabled {
       opacity: 0.4;
@@ -2179,6 +2233,48 @@
         padding-right: 12px;
       }
     }
+    .chat-pull-refresh {
+      --pull-refresh-y: 0px;
+      --pull-refresh-progress: 0;
+      position: absolute;
+      top: 8px;
+      left: 50%;
+      z-index: 48;
+      width: 34px;
+      height: 34px;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid color-mix(in srgb, var(--border) 75%, transparent);
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--panel) 94%, transparent);
+      box-shadow: 0 8px 20px color-mix(in srgb, #000 16%, transparent);
+      opacity: calc(0.25 + (var(--pull-refresh-progress) * 0.75));
+      pointer-events: none;
+      transform: translate(-50%, calc(-42px + var(--pull-refresh-y))) scale(calc(0.82 + (var(--pull-refresh-progress) * 0.18)));
+      transition: opacity 0.16s ease, transform 0.18s cubic-bezier(0.2, 0.8, 0.2, 1), border-color 0.16s ease;
+    }
+    .chat-pull-refresh.is-visible,
+    .chat-pull-refresh.is-refreshing {
+      display: inline-flex;
+    }
+    .chat-pull-refresh.is-ready,
+    .chat-pull-refresh.is-refreshing {
+      border-color: color-mix(in srgb, var(--accent, var(--red)) 58%, transparent);
+      color: var(--accent, var(--red));
+    }
+    .chat-pull-refresh .spinner-whirlpool {
+      margin: 0 !important;
+      width: 18px !important;
+      height: 18px !important;
+    }
+    .chat-pull-refresh canvas {
+      display: block;
+    }
+    #email-lib-modal .email-pull-refresh {
+      top: 112px;
+      z-index: 4;
+    }
     /* Sortable Cookbook column headers had no visual cue, so users couldn't tell
        a header was clickable (the Newest sort on the Model column was invisible).
        Show a pointer + hover highlight, and underline the active sort column. */
@@ -2433,6 +2529,9 @@
       word-wrap: break-word;
       overflow-wrap: break-word;
       overflow: hidden;
+    }
+    .msg-user:has(textarea) {
+      width: 85%;
     }
     .msg-ai {
       align-items: flex-start;
@@ -2725,11 +2824,11 @@
     #chat-form { display:none; }
 
     /* Unified chat input bar */
-    .chat-input-bar {
-      background: var(--input-bg, var(--panel));
-      border: 1px solid var(--input-border, var(--border));
-      border-radius: 16px;
-      padding: 10px 12px;
+	    .chat-input-bar {
+	      background: var(--input-bg, var(--panel));
+	      border: 1px solid var(--input-border, var(--border));
+	      border-radius: 16px;
+	      padding: 10px 12px;
       display: flex;
       flex-direction: column;
       gap: 8px;
@@ -2779,21 +2878,82 @@
       position: relative;
       z-index: 245;
     }
-    .chat-input-top {
+    body.plan-mode-active .chat-input-bar {
+		      border-style: dashed;
+		      border-color: color-mix(in srgb, var(--accent, var(--red)) 55%, transparent);
+		      background: color-mix(in srgb, var(--accent, var(--red)) 8%, var(--input-bg, var(--panel)));
+		    }
+	        .chat-input-top {
       width: 100%;
       position: relative;
     }
-    .chat-input-top > .model-picker-wrap {
+    .plan-mode-status {
+	      position: absolute;
+	      right: 0;
+	      bottom: 2px;
+	      z-index: 245;
+	      display: inline-flex;
+	      align-items: center;
+	      gap: 7px;
+	      height: 22px;
+	      padding: 0 6px 0 8px;
+	      border: 1px solid color-mix(in srgb, var(--accent, var(--red)) 35%, transparent);
+	      border-radius: 999px;
+	      background: color-mix(in srgb, var(--accent, var(--red)) 12%, var(--input-bg, var(--panel)));
+		      color: var(--accent, var(--red));
+		      font-size: 10px;
+		      font-weight: 700;
+		      line-height: 1;
+		      transition: opacity 0.22s ease, transform 0.22s ease;
+		    }
+		    .plan-mode-status[hidden] {
+		      display: none !important;
+		    }
+		    .plan-mode-status.plan-mode-status-autohide {
+		      opacity: 0;
+		      pointer-events: none;
+		      transform: translateY(-4px) scale(0.96);
+		    }
+	    .plan-mode-status-toggle {
+	      width: 26px;
+	      height: 14px;
+	      padding: 0;
+	      border: 1px solid color-mix(in srgb, var(--accent, var(--red)) 55%, transparent);
+	      border-radius: 999px;
+	      background: color-mix(in srgb, var(--accent, var(--red)) 22%, transparent);
+	      cursor: pointer;
+	      position: relative;
+	      flex-shrink: 0;
+	    }
+	    .plan-mode-status-toggle span {
+	      position: absolute;
+	      top: 2px;
+	      right: 2px;
+	      width: 8px;
+	      height: 8px;
+	      border-radius: 50%;
+	      background: var(--accent, var(--red));
+	    }
+	    .plan-mode-status-toggle:hover {
+	      background: color-mix(in srgb, var(--accent, var(--red)) 30%, transparent);
+	    }
+	    .chat-input-top > .model-picker-wrap {
       position: absolute;
       top: 0;
       right: 0;
       /* Composer-local chrome: above the input, below mobile sidebar/modals. */
       z-index: 60;
       transform-origin: top right;
-      transition: opacity 0.22s ease, transform 0.22s ease;
-      will-change: opacity, transform;
-    }
-    .chat-input-top > .model-picker-wrap.model-picker-autohide {
+	      transition: opacity 0.22s ease, transform 0.22s ease;
+	      will-change: opacity, transform;
+	    }
+	    body.plan-mode-active .chat-input-top > .model-picker-wrap {
+	      opacity: 0;
+	      pointer-events: none;
+	      transform: translateY(-4px) scale(0.96);
+	    }
+    .chat-input-top > .model-picker-wrap.model-picker-autohide,
+    .chat-input-top > .model-picker-wrap.picker-auto-hidden {
       opacity: 0;
       pointer-events: none;
       transform: translateY(-4px) scale(0.96);
@@ -2924,12 +3084,23 @@
       opacity: 0.8;
       background: color-mix(in srgb, var(--accent) 8%, transparent);
     }
-    .input-icon-btn.active,
-    .input-icon-btn.expanded {
-      opacity: 1;
-      color: var(--fg);
-      background: color-mix(in srgb, var(--fg) 9%, transparent);
-    }
+	    .input-icon-btn.active,
+	    .input-icon-btn.expanded {
+	      opacity: 1;
+	      color: var(--fg);
+	      background: color-mix(in srgb, var(--fg) 9%, transparent);
+	    }
+	    .plan-mode-btn {
+	      width: 28px;
+	      height: 28px;
+	      padding: 0;
+	      flex-shrink: 0;
+	      top: -2px;
+	    }
+	    .plan-mode-btn.active {
+	      color: var(--accent);
+	      background: color-mix(in srgb, var(--accent) 14%, transparent);
+	    }
     /* GitHub-style task lists (- [ ] / - [x]) */
     li.task-item {
       list-style: none;
@@ -2967,26 +3138,33 @@
       opacity: 0.6;
       text-decoration: line-through;
     }
-    /* Plan window: a draggable/dockable modal (shares .modal framework) */
-    .plan-window-content {
-      width: 520px;
-      max-width: 92vw;
-      max-height: 80vh;
-      display: flex;
-      flex-direction: column;
-    }
-    .plan-window-body {
-      overflow-y: auto;
-      padding: 14px 18px;
-      flex: 1 1 auto;
-      line-height: 1.55;
-    }
-    .plan-window-footer {
-      padding: 10px 18px;
-      border-top: 1px solid color-mix(in srgb, var(--fg) 12%, transparent);
-      display: flex;
-      justify-content: flex-end;
-    }
+	    .plan-inline-actions {
+	      display: flex;
+	      align-items: center;
+	      gap: 7px;
+	      margin-top: 10px;
+	    }
+	    .plan-inline-execute,
+	    .plan-inline-clear {
+	      height: 26px;
+	      border-radius: 7px;
+	      border: 1px solid color-mix(in srgb, var(--fg) 13%, transparent);
+	      background: transparent;
+	      color: var(--fg);
+	      font: inherit;
+	      font-size: 11px;
+	      padding: 0 9px;
+	      display: inline-flex;
+	      align-items: center;
+	      gap: 5px;
+	      cursor: pointer;
+	    }
+	    .plan-inline-execute {
+	      background: color-mix(in srgb, var(--accent, var(--red)) 16%, transparent);
+	      border-color: color-mix(in srgb, var(--accent, var(--red)) 35%, transparent);
+	      color: var(--accent, var(--red));
+	      font-weight: 650;
+	    }
     /* While the menu is open the chevron stays in its highlighted state
        — don't run the opacity fade transition so we never flash from
        0.5 → hover-1.0 → drop-back. The state holds steady. */
@@ -2996,6 +3174,30 @@
     .tool-indicator.active {
       color: var(--red);
       background: color-mix(in srgb, var(--red) 12%, transparent);
+    }
+    #workspace-indicator-btn.active {
+      opacity: 0.5;
+      color: var(--fg);
+      background: none;
+    }
+    #workspace-indicator-btn.active:hover {
+      opacity: 0.8;
+      background: color-mix(in srgb, var(--accent) 8%, transparent);
+    }
+    #workspace-indicator-btn.active > svg:not(.tool-indicator-x),
+    #workspace-indicator-btn.active > span {
+      opacity: 1;
+    }
+    #workspace-indicator-btn .workspace-indicator-icon {
+      opacity: 1 !important;
+      color: currentColor !important;
+      stroke: currentColor !important;
+      flex-shrink: 0;
+    }
+    #workspace-indicator-btn > svg:first-of-type {
+      opacity: 1 !important;
+      color: currentColor !important;
+      stroke: currentColor !important;
     }
     /* Research button glow while actively running */
     #research-toggle-btn.research-running {
@@ -3335,7 +3537,131 @@
       color: color-mix(in srgb, var(--fg) 35%, transparent);
       white-space: nowrap;
       user-select: none;
-      margin-right: 2px;
+      margin-left: 7px;
+      margin-right: 5px;
+    }
+    .chat-context-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+      height: auto;
+      padding: 0;
+      margin-left: 7px;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      color: color-mix(in srgb, var(--fg) 35%, transparent);
+      font-family: inherit;
+      font-size: 0.7rem;
+      font-weight: 400;
+      line-height: 1;
+      cursor: pointer;
+      white-space: nowrap;
+      --ctx-stroke: var(--color-muted, #888);
+      transition: color 0.15s, opacity 0.15s;
+    }
+    .chat-context-pill[hidden] {
+      display: none !important;
+    }
+    .chat-context-pill:hover,
+    .chat-context-pill.open {
+      color: color-mix(in srgb, var(--fg) 70%, transparent);
+      --ctx-stroke: var(--ctx-color);
+      border: 0;
+      background: transparent;
+    }
+    .chat-context-pill.loading {
+      opacity: 0.55;
+    }
+    .chat-context-pill.warn {
+      color: var(--orange, #f59e0b);
+      background: transparent;
+    }
+    .chat-context-pill.danger {
+      color: var(--red, #ef4444);
+      background: transparent;
+    }
+    .chat-context-pill svg {
+      flex-shrink: 0;
+    }
+    .chat-context-pill .ctx-ring-pct {
+      color: currentColor;
+      font-size: inherit;
+      font-weight: inherit;
+      line-height: 1;
+    }
+    .chat-context-dot {
+      display: none;
+    }
+    .chat-context-popup {
+      position: fixed;
+      z-index: 10060;
+      width: 238px;
+      padding: 10px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+      color: var(--fg);
+      box-shadow: 0 12px 34px color-mix(in srgb, #000 26%, transparent);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+    .chat-context-popup.warn {
+      color: var(--orange, #f59e0b);
+    }
+    .chat-context-popup.danger {
+      color: var(--red, #ef4444);
+    }
+    .chat-context-popup-title {
+      font-weight: 650;
+      margin-bottom: 8px;
+    }
+    .chat-context-popup-bar {
+      height: 6px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--fg) 10%, transparent);
+      margin-bottom: 6px;
+    }
+    .chat-context-popup-fill {
+      height: 100%;
+      width: 0;
+      border-radius: inherit;
+      background: currentColor;
+    }
+    .chat-context-popup-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      margin-top: 4px;
+      color: color-mix(in srgb, var(--fg) 70%, transparent);
+    }
+    .chat-context-popup-row span:last-child {
+      color: var(--fg);
+      text-align: right;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-width: 148px;
+    }
+    .chat-context-compact-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 100%;
+      height: 26px;
+      margin-top: 9px;
+      border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+      border-radius: 6px;
+      background: color-mix(in srgb, var(--accent) 12%, transparent);
+      color: var(--accent);
+      cursor: pointer;
+      font: inherit;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .chat-context-compact-btn:hover {
+      background: color-mix(in srgb, var(--accent) 18%, transparent);
     }
     /* Model picker — input bar drop-up */
     .model-picker-wrap {
@@ -3522,9 +3848,25 @@
       max-height: min(280px, 50dvh);
       overflow-y: auto;
     }
+    .model-picker-list.is-loading {
+      max-height: min(120px, 28dvh);
+      overflow: hidden;
+    }
     .model-picker-list.is-empty {
       max-height: 0;
       overflow: hidden;
+    }
+    .model-picker-list .model-picker-loading-row {
+      justify-content: center;
+      gap: 7px;
+      min-height: 38px;
+      padding: 8px 10px;
+      color: color-mix(in srgb, var(--fg) 58%, transparent);
+      font-size: 0.82em;
+    }
+    .model-picker-list .model-picker-loading-row .ai-spinner-whirlpool {
+      position: relative;
+      top: 1px;
     }
     .model-picker-list .model-switch-item {
       display: flex;
@@ -4014,7 +4356,7 @@
     }
     .memory-used-pill:hover { opacity: 1; background: var(--border); }
     /* Nudge label text 1px down so it visually centers with the icon. */
-    .memory-used-pill-text { position: relative; top: 1px; display: inline-block; }
+    .memory-used-pill-text { position: relative; top: -1px; display: inline-block; }
     .memory-used-detail {
       position: fixed;
       background: var(--panel);
@@ -4848,6 +5190,20 @@
       .sidebar.right-side {
         left: auto; right: 0;
         box-shadow: -4px 0 20px rgba(0,0,0,0.5);
+      }
+      html.ody-sidebar-off .sidebar,
+      html.ody-mobile-startup-sidebar-hidden .sidebar {
+        transform: translateX(-100%) !important;
+        pointer-events: none !important;
+        opacity: 0 !important;
+      }
+      html.ody-sidebar-off .sidebar.right-side,
+      html.ody-mobile-startup-sidebar-hidden .sidebar.right-side {
+        transform: translateX(100%) !important;
+      }
+      html.ody-sidebar-off .icon-rail,
+      html.ody-mobile-startup-sidebar-hidden .icon-rail {
+        display: none !important;
       }
       /* Backdrop behind sidebar */
       #sidebar-backdrop {
@@ -5904,14 +6260,10 @@
     .window-resizing {
       transition:none !important;
     }
-    /* Cookbook's modal-content is var(--bg) (inline) instead of the default
-       var(--panel), so its sticky header — which defaults to var(--panel) —
-       read as a different-coloured band. Match the header to the cookbook
-       body so the panel is one uniform colour. */
+    /* Cookbook opts out of the sticky header on mobile; the title bar scrolls
+       away with the content instead of following. Background is inherited from
+       the shared .modal-header rule so frosted/glass themes stay consistent. */
     #cookbook-modal .modal-header {
-      background: var(--bg);
-      /* Cookbook opts out of the sticky header on mobile; the
-         title bar scrolls away with the content instead of following. */
       position: static;
       top: auto;
     }
@@ -5929,10 +6281,10 @@
     }
     .close-btn,
     .modal-close {
-      background:var(--bg);
-      color:var(--fg);
-      border:1px solid var(--fg);
-      font-size:12px;
+      background:transparent;
+      color:color-mix(in srgb, var(--fg) 58%, transparent);
+      border:1px solid transparent;
+      font-size:0;
       width:24px;
       height:24px;
       padding:0;
@@ -5942,9 +6294,28 @@
       line-height:1;
       text-indent:0;
       cursor:pointer;
-      border-radius:4px;
+      border-radius:999px;
       line-height:1;
       flex-shrink:0;
+      position:relative;
+    }
+    .close-btn > svg,
+    .modal-close > svg {
+      display:none;
+    }
+    .close-btn::before,
+    .modal-close::before {
+      content:"";
+      width:10px;
+      height:10px;
+      display:block;
+      background:currentColor;
+      -webkit-mask:
+        url("data:image/svg+xml,%3Csvg width='10' height='10' viewBox='0 0 10 10' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M2 2L8 8M8 2L2 8' stroke='black' stroke-width='1.8' stroke-linecap='round'/%3E%3C/svg%3E")
+        center / contain no-repeat;
+      mask:
+        url("data:image/svg+xml,%3Csvg width='10' height='10' viewBox='0 0 10 10' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M2 2L8 8M8 2L2 8' stroke='black' stroke-width='1.8' stroke-linecap='round'/%3E%3C/svg%3E")
+        center / contain no-repeat;
     }
     .close-btn:hover,
     .modal-close:hover {
@@ -5955,23 +6326,32 @@
     }
     /* Minimize button — sits beside the close button on every modal */
     .minimize-btn {
-      background:var(--bg);
-      color:var(--fg);
-      border:1px solid var(--fg);
-      font-size:14px;
+      background:transparent;
+      color:color-mix(in srgb, var(--fg) 58%, transparent);
+      border:1px solid transparent;
+      font-size:0;
       font-weight:700;
       width:24px;
       height:24px;
-      padding:0 0 6px 0; /* nudge the underscore visually toward the middle */
+      padding:0;
       display:inline-flex;
       align-items:center;
       justify-content:center;
       line-height:1;
       cursor:pointer;
-      border-radius:4px;
+      border-radius:999px;
       flex-shrink:0;
       margin-left:auto; /* push to the right so it docks next to .close-btn */
       margin-right:4px;
+    }
+    .minimize-btn::before {
+      content:"";
+      width:9px;
+      height:2px;
+      border-radius:999px;
+      background:currentColor;
+      display:block;
+      transform:translateY(2px);
     }
     .minimize-btn:hover {
       background:var(--fg);

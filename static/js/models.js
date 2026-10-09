@@ -175,20 +175,30 @@ function _buildModelRow(mid, url, displayName, endpointId, offline, modelType) {
   return row;
 }
 
-export async function refreshModels(force = false) {
+export async function refreshModels(force = false, opts = {}) {
   const box = document.getElementById('models');
+  const cacheOnly = !!(opts && opts.cacheOnly);
+  const hasCache = _cachedItems.length > 0;
 
   // Skip network fetch if cache is fresh and not forced — still re-render UI
+  // Cache-only is used for cheap picker/settings opens, but it must not turn a
+  // cold page load into an empty model list. If nothing has been fetched in this
+  // tab yet, do one normal load.
   const now = Date.now();
-  const needsFetch = force || _cachedItems.length === 0 || (now - _lastFetchTime) >= _FETCH_CACHE_TTL;
+  const needsFetch = !(cacheOnly && hasCache) && (force || _cachedItems.length === 0 || (now - _lastFetchTime) >= _FETCH_CACHE_TTL);
 
-  if (box) box.innerHTML = '';
+  const hadRenderedRows = !!(box && box.children && box.children.length);
+  if (box && (!needsFetch || !hadRenderedRows)) box.innerHTML = '';
   if (needsFetch) {
     let _loadingSpinner = null;
     if (box) {
-      _loadingSpinner = spinnerModule.create('', 'right', 'wave');
-      box.appendChild(_loadingSpinner.createElement());
-      _loadingSpinner.start();
+      if (hadRenderedRows) {
+        box.classList.add('models-refreshing');
+      } else {
+        _loadingSpinner = spinnerModule.create('', 'right', 'wave');
+        box.appendChild(_loadingSpinner.createElement());
+        _loadingSpinner.start();
+      }
     }
     try {
       if (force) _fetchInflight = null;
@@ -219,6 +229,7 @@ export async function refreshModels(force = false) {
       return;
     } finally {
       try { _loadingSpinner && _loadingSpinner.stop && _loadingSpinner.stop(); } catch (_) {}
+      if (box) box.classList.remove('models-refreshing');
       if (box) box.innerHTML = '';
     }
   }

@@ -18,15 +18,21 @@ from types import SimpleNamespace
 import pytest
 
 from src.tool_execution import (
+    NO_TOOL_SECURITY_CONTEXT,
     _AGENT_WORKDIR,
     _active_workspace,
     _resolve_search_root,
     _resolve_tool_path,
     _resolve_tool_path_in_workspace,
     agent_cwd,
-    execute_tool_block,
+    execute_tool_block as _execute_tool_block,
     get_active_workspace,
 )
+
+
+async def execute_tool_block(*args, **kwargs):
+    kwargs.setdefault("security_context", NO_TOOL_SECURITY_CONTEXT)
+    return await _execute_tool_block(*args, **kwargs)
 
 
 def _block(tool, content=""):
@@ -123,6 +129,67 @@ async def test_read_write_edit_confined_e2e(ws, admin):
     _, r = await execute_tool_block(_block("write_file", f"{escape}\nx"), owner="a", workspace=ws)
     assert r["exit_code"] == 1 and "outside the workspace" in r["error"]
     assert not os.path.exists(escape)
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_confined_e2e(ws, admin):
+    with open(os.path.join(ws, "patchme.txt"), "w") as f:
+        f.write("alpha\nbeta\ngamma\n")
+    patch = """*** Begin Patch
+*** Update File: patchme.txt
+@@
+ alpha
+-beta
++BETA
+ gamma
+*** Add File: added.txt
++new file
+*** End Patch"""
+    _, r = await execute_tool_block(_block("apply_patch", patch), owner="a", workspace=ws)
+    assert r["exit_code"] == 0
+    assert r["diff"]["added"] >= 2
+    with open(os.path.join(ws, "patchme.txt")) as f:
+        assert f.read() == "alpha\nBETA\ngamma\n"
+    with open(os.path.join(ws, "added.txt")) as f:
+        assert f.read() == "new file\n"
+
+    outside = tempfile.mkdtemp()
+    outside_file = os.path.join(outside, "x.txt")
+    with open(outside_file, "w") as f:
+        f.write("x\n")
+    escape_patch = f"""*** Begin Patch
+*** Update File: {outside_file}
+@@
+-x
++y
+*** End Patch"""
+    _, r = await execute_tool_block(_block("apply_patch", escape_patch), owner="a", workspace=ws)
+    assert r["exit_code"] == 1 and "outside the workspace" in r["error"]
+    with open(outside_file) as f:
+        assert f.read() == "x\n"
+
+
+@pytest.mark.asyncio
+async def test_todowrite_persists_session_list(tmp_path, monkeypatch, admin):
+    import src.agent_tools.coding_tools as coding_tools
+
+    monkeypatch.setattr(coding_tools, "_TODO_DIR", str(tmp_path))
+    payload = {
+        "todos": [
+            {"content": "Inspect code", "status": "completed", "priority": "high"},
+            {"content": "Patch code", "status": "in_progress", "priority": "high"},
+        ]
+    }
+    _, r = await execute_tool_block(
+        _block("todowrite", json.dumps(payload)),
+        session_id="chat/one",
+        owner="a",
+        workspace=str(tmp_path),
+    )
+    assert r["exit_code"] == 0
+    assert "[>] Patch code" in r["output"]
+    saved = json.load(open(tmp_path / "chat_one.json", encoding="utf-8"))
+    assert saved["todos"][1]["status"] == "in_progress"
 
 
 @pytest.mark.asyncio
@@ -281,6 +348,23 @@ def test_low_signal_with_workspace_surfaces_readonly_file_tools(monkeypatch):
     assert "python" not in names
 
 
+def test_workspace_coding_request_surfaces_edit_and_verify_tools(monkeypatch):
+    names, _ = _sent_tool_names(
+        monkeypatch,
+        workspace="/tmp",
+        text="fix the failing frontend test in this repo",
+    )
+    assert "get_workspace" in names
+    assert "read_file" in names
+    assert "grep" in names
+    assert "edit_file" in names
+    assert "write_file" in names
+    assert "apply_patch" in names
+    assert "todowrite" in names
+    assert "bash" in names
+    assert "python" in names
+
+
 def test_low_signal_without_workspace_excludes_file_tools(monkeypatch):
     names, _ = _sent_tool_names(monkeypatch, workspace=None)
     assert "read_file" not in names
@@ -404,6 +488,59 @@ def test_long_history_gets_conversation_brief_with_tool_ledger(monkeypatch):
     assert "edit_file" in brief
     assert "static/js/modalManager.js" in brief
     assert any("Conversation briefing rule" in str(msg.get("content", "")) for msg in messages)
+
+def test_explicit_workspace_request_without_workspace_stops(monkeypatch):
+    import asyncio
+    from src.agent_loop import _loop as al
+
+    monkeypatch.setattr(al, "get_setting", lambda key, default=None: default, raising=False)
+    monkeypatch.setattr(al, "get_mcp_manager", lambda: None, raising=False)
+    monkeypatch.setattr(al, "estimate_tokens", lambda *a, **k: 10, raising=False)
+    monkeypatch.setattr(al, "blocked_tools_for_owner", lambda owner: set(), raising=False)
+
+    async def _should_not_stream(*args, **kwargs):
+        raise AssertionError("LLM should not be called when explicit workspace is missing")
+        yield ""
+
+    monkeypatch.setattr(al, "stream_llm_with_fallback", _should_not_stream, raising=False)
+
+    async def _run():
+        gen = al.stream_agent_loop(
+            "https://api.openai.com/v1", "gpt-test",
+            [{"role": "user", "content": "In this workspace, fix a typo and verify it."}],
+            max_rounds=1, relevant_tools=None, owner="admin", workspace=None,
+        )
+        return [c async for c in gen]
+
+    chunks = asyncio.run(_run())
+    text = "".join(chunks)
+    assert "No active workspace is set" in text
+    assert "/workspace set /absolute/path" in text
+    assert '"missing_workspace": true' in text
+
+
+def test_workspace_coding_mode_prompt_is_injected(monkeypatch):
+    from src.agent_loop import _prompts as al
+
+    monkeypatch.setattr(al, "get_setting", lambda key, default=None: default, raising=False)
+    monkeypatch.setattr(al, "get_mcp_manager", lambda: None, raising=False)
+    monkeypatch.setattr(al, "blocked_tools_for_owner", lambda owner: set(), raising=False)
+    al._cached_base_prompt = None
+    al._cached_base_prompt_key = None
+
+    messages, _ = al._build_system_prompt(
+        messages=[{"role": "user", "content": "fix the bug"}],
+        model="gpt-test",
+        active_document=None,
+        mcp_mgr=None,
+        relevant_tools={"get_workspace", "read_file", "grep", "edit_file", "write_file", "apply_patch", "todowrite", "bash"},
+        workspace="/tmp/example-repo",
+    )
+    system_text = "\n\n".join(m.get("content", "") for m in messages if m.get("role") == "system")
+    assert "## Workspace coding mode" in system_text
+    assert "Active workspace: `/tmp/example-repo`" in system_text
+    assert "call `todowrite`" in system_text
+    assert "Change repo files with `apply_patch`" in system_text
 
 
 # ── browse route is admin-gated ─────────────────────────────────────────

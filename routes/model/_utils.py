@@ -46,10 +46,12 @@ _ENDPOINT_SETTING_FIELDS = {
 }
 
 _ENDPOINT_FALLBACK_FIELDS = {
-    "default_model_fallbacks": "Default Model Fallbacks",
+    "foreground_model_fallbacks": "Foreground Model Fallbacks",
     "utility_model_fallbacks": "Utility Model Fallbacks",
     "vision_model_fallbacks":  "Vision Model Fallbacks",
 }
+# `default_model_fallbacks` is intentionally absent. The legacy data remains
+# stored as-is even when an endpoint is removed, but no longer affects routing.
 
 
 def _speech_settings_using_endpoint(settings: dict, ep_id: str) -> list:
@@ -179,7 +181,12 @@ def _clear_user_pref_endpoint_refs(all_prefs: dict, ep_id: str) -> int:
     if not isinstance(all_prefs, dict):
         return 0
     users = all_prefs.get("_users")
-    pref_sets = users.values() if isinstance(users, dict) else [all_prefs]
+    # A mixed store can contain auth-disabled foreground policy at the root
+    # alongside named-owner preferences. Both are active namespaces; legacy
+    # `default_model_fallbacks` remains untouched by the field allowlist.
+    pref_sets = [all_prefs]
+    if isinstance(users, dict):
+        pref_sets.extend(users.values())
     cleared_users = 0
     for prefs in pref_sets:
         if isinstance(prefs, dict) and _clear_endpoint_settings_for_endpoint(prefs, ep_id):
@@ -473,7 +480,11 @@ def _endpoint_kind(ep: Any) -> str:
 
 
 def _endpoint_refresh_mode(ep: Any, endpoint_kind: str | None = None) -> str:
-    return _normalize_refresh_mode(getattr(ep, "model_refresh_mode", None), endpoint_kind or _endpoint_kind(ep))
+    return _normalize_endpoint_refresh_mode(
+        getattr(ep, "model_refresh_mode", None),
+        endpoint_kind or _endpoint_kind(ep),
+        getattr(ep, "base_url", ""),
+    )
 
 
 def _endpoint_refresh_interval(ep: Any, category: str) -> float:
@@ -964,6 +975,99 @@ def _ollama_model_names(data: Any) -> List[str]:
     return out
 
 
+def _is_google_api_base(base_url: str) -> bool:
+    try:
+        return (urlparse(base_url).hostname or "").lower() == "generativelanguage.googleapis.com"
+    except Exception:
+        return False
+
+
+def _normalize_endpoint_refresh_mode(value: Any, endpoint_kind: str = "auto", base_url: str = "") -> str:
+    if not str(value or "").strip() and _is_google_api_base(base_url):
+        return "manual"
+    return _normalize_refresh_mode(value, endpoint_kind)
+
+
+def _google_native_root(base_url: str) -> str:
+    """Return the Gemini native API root for a Google endpoint.
+
+    Chat calls may be configured against Google's OpenAI-compatible
+    `/openai` path, but model catalog reads should use the native Models API
+    so we get Google's current Model resource shape.
+    """
+    try:
+        parsed = urlparse(base_url)
+    except Exception:
+        return "https://generativelanguage.googleapis.com/v1beta"
+    path = (parsed.path or "").rstrip("/")
+    if path.endswith("/openai"):
+        path = path[: -len("/openai")].rstrip("/")
+    if not path:
+        path = "/v1beta"
+    return urlunparse(parsed._replace(path=path, query="", fragment="")).rstrip("/")
+
+
+def _google_native_models_url(base_url: str) -> str:
+    return _google_native_root(base_url) + "/models"
+
+
+def _google_model_id_from_item(item: Any) -> str:
+    if not isinstance(item, dict):
+        return ""
+    value = item.get("baseModelId") or item.get("name") or item.get("model") or ""
+    return str(value or "").strip().removeprefix("models/")
+
+
+def _google_model_supports_chat(item: Any) -> bool:
+    """Return whether a native Google Model resource supports chat generation."""
+    if not isinstance(item, dict):
+        return False
+    methods = item.get("supportedGenerationMethods")
+    if not isinstance(methods, list):
+        return False
+    chat_methods = {"generateContent", "generateMessage", "generateText", "generateAnswer"}
+    return any(method in chat_methods for method in methods)
+
+
+def _probe_google_models(base_url: str, api_key: str = None, timeout: int = 5, page_size: int = 1000) -> List[str]:
+    """Read Google's native paginated Models API.
+
+    This intentionally returns only provider-reported model IDs. Capability
+    mapping is handled by the model capability reader and must not infer from
+    names here.
+    """
+    url = _google_native_models_url(base_url)
+    try:
+        page_size = min(max(int(page_size or 1000), 1), 1000)
+    except Exception:
+        page_size = 1000
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["x-goog-api-key"] = api_key
+    params: Dict[str, Any] = {"pageSize": page_size}
+    models: List[str] = []
+    seen = set()
+    page_token = ""
+    for _ in range(20):
+        request_params = dict(params)
+        if page_token:
+            request_params["pageToken"] = page_token
+        r = httpx.get(url, headers=headers, params=request_params, timeout=timeout, verify=llm_verify())
+        r.raise_for_status()
+        data = r.json()
+        for item in data.get("models") or []:
+            if not _google_model_supports_chat(item):
+                continue
+            model_id = _google_model_id_from_item(item)
+            if model_id and model_id not in seen:
+                seen.add(model_id)
+                models.append(model_id)
+        page_token = str(data.get("nextPageToken") or "").strip()
+        if not page_token:
+            break
+    return models
+
+
 def _filter_probed_models(models: List[str], include_non_chat: bool = False) -> List[str]:
     return list(models or []) if include_non_chat else [m for m in (models or []) if _is_chat_model(m)]
 
@@ -984,6 +1088,17 @@ def _probe_endpoint(
         from src.chatgpt_subscription import fetch_available_models
         if api_key:
             return fetch_available_models(api_key, timeout=timeout)
+        return []
+    if _is_google_api_base(base):
+        try:
+            models = _probe_google_models(base, api_key, timeout=timeout)
+            if models:
+                return models
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code if e.response is not None else "unknown"
+            logger.warning(f"Google native models probe failed: HTTP {status}")
+        except Exception as e:
+            logger.warning(f"Google native models probe failed: {e}")
         return []
     if provider == "anthropic":
         # Try Anthropic's /v1/models endpoint first
@@ -1369,6 +1484,56 @@ def _visible_models(cached_models, hidden_models, pinned_models=None):
         return merged
     hidden = set(_normalize_model_ids(hidden_models))
     return [m for m in merged if m not in hidden]
+
+
+def _picker_requires_pinning(base_url: str, kind: str) -> bool:
+    return _classify_endpoint(base_url, kind) == "api"
+
+
+def _has_explicit_pinned_models(ep) -> bool:
+    """Whether pinned_models was deliberately written for this endpoint.
+
+    API endpoints use pinned_models as an allow-list. An explicit empty JSON
+    list means "show no models"; it must not fall back to the old hidden-list
+    migration behavior.
+    """
+    raw = getattr(ep, "pinned_models", None)
+    return raw is not None and str(raw).strip() != ""
+
+
+def _legacy_visible_api_models(ep) -> List[str]:
+    """Return API models selected under the old hidden-list picker.
+
+    Before API endpoints switched to an explicit allow-list, selected models
+    were represented as cached_models minus hidden_models. Existing OpenRouter
+    rows can therefore have many checked models and an empty pinned_models
+    field. Treat that old state as the initial pinned list so settings and chat
+    agree after upgrade.
+    """
+    return _visible_models(
+        _cached_model_ids(ep),
+        getattr(ep, "hidden_models", None),
+        None,
+    )
+
+
+def _picker_models_for_endpoint(ep, base_url: str, kind: str):
+    """Return model IDs that should appear in the picker for an endpoint.
+
+    API providers expose remote inventory from /v1/models. Default to that
+    visible inventory until an explicit pinned-model allow-list is saved.
+    Local/self-hosted endpoints keep the older hide-list behavior.
+    """
+    pinned = _normalize_model_ids(getattr(ep, "pinned_models", None))
+    if _picker_requires_pinning(base_url, kind):
+        if not _has_explicit_pinned_models(ep):
+            pinned = _legacy_visible_api_models(ep)
+        return pinned, pinned
+    return _visible_models(
+        _cached_model_ids(ep),
+        getattr(ep, "hidden_models", None),
+        pinned,
+    ), pinned
 
 
 def _api_key_fingerprint(api_key: Optional[str]) -> str:
