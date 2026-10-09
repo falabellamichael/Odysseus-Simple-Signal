@@ -1306,6 +1306,23 @@ async def do_ui_control(content: str, session_id: Optional[str] = None, owner: O
 # Image generation
 # ---------------------------------------------------------------------------
 
+async def _download_generated_image_url(image_url: str):
+    """Fetch a provider image with pinned public DNS and a bounded body."""
+    from src.constants import WEB_FETCH_HARD_MAX_BYTES
+    from src.outbound_fetch import _get_public_url
+
+    response = await asyncio.to_thread(
+        _get_public_url,
+        image_url,
+        {},
+        60,
+        max_bytes=WEB_FETCH_HARD_MAX_BYTES,
+    )
+    if response.truncated:
+        raise ValueError("Generated image exceeds the download size limit.")
+    return response
+
+
 async def do_generate_image(content: str, session_id: Optional[str] = None, owner: Optional[str] = None) -> Dict:
     """Generate an image using an image-capable model (e.g. gpt-image-1).
 
@@ -1471,27 +1488,62 @@ async def do_generate_image(content: str, session_id: Optional[str] = None, owne
         base_url = _ollama_openai_image_base(url)
     else:
         base_url = url.replace("/chat/completions", "").replace("/v1/messages", "").rstrip("/")
-    images_url = base_url + "/images/generations"
+    base_lower = base_url.lower()
+    is_dashscope_image = "aliyuncs.com" in base_lower or "dashscope" in base_lower
 
-    # Validate size for cloud image models (local diffusion accepts any WxH)
-    valid_gpt_sizes = {"1024x1024", "1024x1536", "1536x1024", "auto"}
-    valid_dalle3_sizes = {"1024x1024", "1024x1792", "1792x1024"}
-    if is_gpt_image and size not in valid_gpt_sizes:
-        size = "1024x1024"
-    elif is_dalle and size not in valid_dalle3_sizes:
-        size = "1024x1024"
+    if is_dashscope_image:
+        from urllib.parse import urlsplit, urlunsplit
+        parsed = urlsplit(base_url)
+        path = parsed.path.rstrip("/")
+        lower_path = path.lower()
+        if "/compatible-mode/v1" in lower_path:
+            path = path[:lower_path.index("/compatible-mode/v1")] + "/api/v1"
+        elif "/api/v1" in lower_path:
+            path = path[:lower_path.index("/api/v1") + len("/api/v1")]
+        elif lower_path.endswith("/v1"):
+            path = path[:-3].rstrip("/") + "/api/v1"
+        else:
+            path = path + "/api/v1" if path else "/api/v1"
+        images_url = urlunsplit((
+            parsed.scheme, parsed.netloc,
+            path + "/services/aigc/multimodal-generation/generation", "", ""
+        ))
+        dash_size = size.replace("x", "*")
+        payload = {
+            "model": model_id,
+            "input": {
+                "messages": [{
+                    "role": "user",
+                    "content": [{"text": prompt}]
+                }]
+            },
+            "parameters": {
+                "size": dash_size,
+                "n": 1,
+            },
+        }
+    else:
+        images_url = base_url + "/images/generations"
 
-    payload = {
-        "model": model_id,
-        "prompt": prompt,
-        "n": 1,
-        "size": size,
-    }
-    if is_ollama_image:
-        payload["response_format"] = "b64_json"
+        # Validate size for cloud image models (local diffusion accepts any WxH)
+        valid_gpt_sizes = {"1024x1024", "1024x1536", "1536x1024", "auto"}
+        valid_dalle3_sizes = {"1024x1024", "1024x1792", "1792x1024"}
+        if is_gpt_image and size not in valid_gpt_sizes:
+            size = "1024x1024"
+        elif is_dalle and size not in valid_dalle3_sizes:
+            size = "1024x1024"
 
-    # GPT image models and local diffusion endpoints support quality; DALL-E and Ollama do not.
-    if is_gpt_image or (is_local_diffusion and not is_ollama_image):
+        payload = {
+            "model": model_id,
+            "prompt": prompt,
+            "n": 1,
+            "size": size,
+        }
+        if is_ollama_image:
+            payload["response_format"] = "b64_json"
+
+    # GPT image models and local diffusion endpoints support quality; DALL-E, Ollama, and DashScope do not.
+    if not is_dashscope_image and (is_gpt_image or (is_local_diffusion and not is_ollama_image)):
         if quality in ("low", "medium", "high", "auto"):
             payload["quality"] = quality
         else:
@@ -1562,6 +1614,81 @@ async def do_generate_image(content: str, session_id: Optional[str] = None, owne
                 }
 
             data = resp.json()
+            if is_dashscope_image:
+                # DashScope returns: output.choices[0].message.content[0].image
+                # The image field can be an HTTP URL or a base64 data URI.
+                image_url = None
+                image_id = ""
+                try:
+                    output = data.get("output", {})
+                    choices = output.get("choices", [])
+                    if choices:
+                        msg_content = choices[0].get("message", {}).get("content", [])
+                        if msg_content:
+                            image_url = msg_content[0].get("image", "")
+                except Exception:
+                    pass
+                if not image_url:
+                    import json as _json
+                    def _find_image(node, depth=0):
+                        if node is None or depth > 5:
+                            return None
+                        if isinstance(node, str):
+                            s = node.strip()
+                            if s.startswith("http://") or s.startswith("https://") or s.startswith("data:image/"):
+                                return s
+                            return None
+                        if isinstance(node, list):
+                            for item in node:
+                                r = _find_image(item, depth + 1)
+                                if r:
+                                    return r
+                            return None
+                        if isinstance(node, dict):
+                            for k in ("image", "url", "b64_json", "image_url"):
+                                if k in node:
+                                    r = _find_image(node[k], depth + 1)
+                                    if r:
+                                        return r
+                            return None
+                        return None
+                    image_url = _find_image(data) or ""
+                if not image_url:
+                    return {"error": "DashScope returned no image URL"}
+
+                # Download remote URL and save locally
+                if image_url.startswith("http://") or image_url.startswith("https://"):
+                    try:
+                        dl_resp = await _download_generated_image_url(image_url)
+                        if dl_resp.status_code == 200:
+                            image_url, image_id = _save_image_bytes(dl_resp.content)
+                        # else keep remote URL as fallback (image_id stays "")
+                    except Exception as _dl_e:
+                        logger.warning("Failed to download DashScope image: %s", type(_dl_e).__name__)
+                        return {
+                            "error": "Generated image URL could not be downloaded safely.",
+                            "untrusted_content": True,
+                        }
+                elif image_url.startswith("data:image/"):
+                    # DashScope returned a base64 data URI — decode and save locally
+                    try:
+                        header, b64_data = image_url.split(",", 1)
+                        raw_bytes = base64.b64decode(b64_data)
+                        image_url, image_id = _save_image_bytes(raw_bytes)
+                    except Exception as _b64_e:
+                        logger.warning(f"Failed to decode DashScope base64 image: {_b64_e}")
+                        # image_url stays as the data URI, image_id stays ""
+
+                return {
+                    "results": f"Generated image for: {prompt[:100]}",
+                    "image_url": image_url,
+                    "image_id": image_id,
+                    "image_prompt": prompt,
+                    "image_model": model_id,
+                    "image_size": size,
+                    "image_quality": "medium",
+                }
+
             if is_gemini_image:
                 image_b64 = _extract_gemini_image_b64(data)
                 if not image_b64:
